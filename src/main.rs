@@ -19,8 +19,11 @@ struct RawProbeRecord {
     is_random: bool,
     ssid: String,
     vendor: String,
+    device_state: String,
     wifi_gen: String,
     mimo: String,
+    security: String,
+    fp_hash: String,
     channel: u8,
     peak_rssi: i8,
     min_rssi: i8,
@@ -44,8 +47,11 @@ struct EnrichedProbe {
     rssi_min: i8,
     ssid: String,
     vendor: String,
+    device_state: String,
     wifi_gen: String,
     mimo: String,
+    security: String,
+    fp_hash: String,
     channel: u8,
     count: u32,
     seq_range: String,
@@ -72,6 +78,16 @@ fn get_timestamp() -> String {
         .unwrap_or_default()
         .as_secs();
     format!("{}", now)
+}
+
+/// Computes a compact 64-bit FNV-1a hash formatted as 8 hex characters
+fn fnv1a_hash(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (h ^ (h >> 32)) as u32)
 }
 
 /// Parses Radiotap header to extract (RSSI dBm, Channel/Frequency, header_len)
@@ -102,7 +118,6 @@ fn parse_radiotap(buf: &[u8]) -> Option<(i8, u8, usize)> {
     let flags = present_words[0];
     let mut data_offset = offset;
 
-    // Follow Radiotap fields order according to spec:
     // Bit 0: TSFT (8 bytes, 8-align)
     if (flags & (1 << 0)) != 0 {
         data_offset = (data_offset + 7) & !7;
@@ -167,12 +182,12 @@ fn parse_radiotap(buf: &[u8]) -> Option<(i8, u8, usize)> {
     Some((rssi, channel, header_len))
 }
 
-/// Parses WPS (Wi-Fi Protected Setup) sub-TLVs inside Vendor IE (00:50:f2:04)
+/// Parses WPS sub-TLVs inside Vendor IE (00:50:f2:04)
 fn parse_wps_vendor(tag_data: &[u8]) -> Option<String> {
     if tag_data.len() < 4 {
         return None;
     }
-    let mut sub_offset = 4; // Skip OUI (3 bytes) and OUI Type (1 byte)
+    let mut sub_offset = 4;
     let mut dev_name: Option<String> = None;
     let mut model_name: Option<String> = None;
     let mut manufacturer: Option<String> = None;
@@ -189,7 +204,6 @@ fn parse_wps_vendor(tag_data: &[u8]) -> Option<String> {
         let val_bytes = &tag_data[sub_offset..sub_offset + attr_len];
         match attr_type {
             0x1011 => {
-                // Device Name
                 if let Ok(s) = std::str::from_utf8(val_bytes) {
                     let trimmed = s.trim().trim_matches('\0');
                     if !trimmed.is_empty() {
@@ -198,7 +212,6 @@ fn parse_wps_vendor(tag_data: &[u8]) -> Option<String> {
                 }
             }
             0x1021 => {
-                // Manufacturer
                 if let Ok(s) = std::str::from_utf8(val_bytes) {
                     let trimmed = s.trim().trim_matches('\0');
                     if !trimmed.is_empty() {
@@ -207,7 +220,6 @@ fn parse_wps_vendor(tag_data: &[u8]) -> Option<String> {
                 }
             }
             0x1023 => {
-                // Model Name
                 if let Ok(s) = std::str::from_utf8(val_bytes) {
                     let trimmed = s.trim().trim_matches('\0');
                     if !trimmed.is_empty() {
@@ -274,6 +286,12 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
     let mut has_he = false;
     let mut vendor = "Generic / Hidden".to_string();
     let mut mimo = "1x1 SISO".to_string();
+    let mut device_state = "Background / Idle".to_string();
+    let mut is_apple = false;
+    let mut apple_screen_active = false;
+
+    let mut security_caps = Vec::new();
+    let mut fp_raw_bytes = Vec::with_capacity(64);
 
     while offset + 2 <= frame.len() {
         let tag_num = frame[offset];
@@ -286,6 +304,9 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
 
         let tag_data = &frame[offset..offset + tag_len];
 
+        // Track Information Element sequence for fingerprinting
+        fp_raw_bytes.push(tag_num);
+
         match tag_num {
             0 => {
                 // SSID
@@ -294,6 +315,8 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
                         let clean: String = s.chars().filter(|c| !c.is_control() && *c != '\0').collect();
                         if !clean.is_empty() {
                             ssid = clean;
+                            // Directed probe to specific SSID indicates active connection search
+                            device_state = "Active (Directed)".to_string();
                         }
                     }
                 }
@@ -308,30 +331,60 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
                     }
                 }
             }
+            127 => {
+                // Extended Capabilities (Security & Roaming)
+                // Byte 2, bit 3 (bit 19): 802.11v BSS Transition
+                if tag_data.len() > 2 && (tag_data[2] & (1 << 3)) != 0 {
+                    security_caps.push("802.11v");
+                }
+                // Byte 3, bit 7 (bit 31): 802.11w PMF (Protected Management Frames)
+                if tag_data.len() > 3 && (tag_data[3] & (1 << 7)) != 0 {
+                    security_caps.push("PMF");
+                }
+                // Byte 9, bit 1 (bit 73): WPA3-SAE Hash-to-Element
+                if tag_data.len() > 9 && (tag_data[9] & (1 << 1)) != 0 {
+                    security_caps.push("WPA3");
+                }
+            }
             191 => {
                 // VHT Capabilities (Wi-Fi 5)
                 has_vht = true;
             }
             255 => {
                 // Extension elements (Wi-Fi 6 / HE is under Ext ID 35)
-                if tag_len > 0 && tag_data[0] == 35 {
-                    has_he = true;
+                if tag_len > 0 {
+                    fp_raw_bytes.push(tag_data[0]);
+                    if tag_data[0] == 35 {
+                        has_he = true;
+                    }
                 }
             }
             221 => {
                 // Vendor Specific IE
                 if tag_data.len() >= 4 && tag_data[0..4] == [0x00, 0x50, 0xf2, 0x04] {
                     // Microsoft WPS Element
+                    fp_raw_bytes.extend_from_slice(&[0x00, 0x50, 0xf2, 0x04]);
                     if let Some(wps_name) = parse_wps_vendor(tag_data) {
                         vendor = wps_name;
+                        device_state = "Active (WPS)".to_string();
                     } else if vendor == "Generic / Hidden" {
                         vendor = "Microsoft WPS".to_string();
                     }
                 } else if tag_data.len() >= 3 {
                     let oui = &tag_data[0..3];
+                    fp_raw_bytes.extend_from_slice(oui);
                     if oui == [0x00, 0x17, 0xf2] {
+                        is_apple = true;
                         if vendor == "Generic / Hidden" {
                             vendor = "Apple iOS / macOS".to_string();
+                        }
+                        // Apple Continuity / AirPort state inspection
+                        if tag_data.len() >= 5 {
+                            let sub_type = tag_data[3];
+                            let flag = tag_data[4];
+                            if sub_type == 0x01 && (flag & 0x01 != 0 || tag_data.len() > 6) {
+                                apple_screen_active = true;
+                            }
                         }
                     } else if oui == [0x00, 0x50, 0xf2] {
                         if vendor == "Generic / Hidden" {
@@ -358,6 +411,22 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
         offset += tag_len;
     }
 
+    if is_apple {
+        device_state = if apple_screen_active {
+            "Screen On / Active".to_string()
+        } else {
+            "Screen Off / Sleep".to_string()
+        };
+    }
+
+    let security = if security_caps.is_empty() {
+        "Standard".to_string()
+    } else {
+        security_caps.join("/")
+    };
+
+    let fp_hash = fnv1a_hash(&fp_raw_bytes);
+
     let wifi_gen = if has_he {
         "Wi-Fi 6 (802.11ax)"
     } else if has_vht {
@@ -377,8 +446,11 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
         is_random,
         ssid,
         vendor,
+        device_state,
         wifi_gen,
         mimo,
+        security,
+        fp_hash,
         channel,
         peak_rssi: rssi,
         min_rssi: rssi,
@@ -394,7 +466,6 @@ fn parse_probe_frame(buf: &[u8], radiotap_len: usize, rssi: i8, channel: u8) -> 
 fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
     let avg_rssi = (raw.rssi_sum / raw.count as i32) as i8;
 
-    // Proximity Zone classification based on Peak RSSI
     let proximity = if raw.peak_rssi >= -50 {
         "Immediate (<3m)".to_string()
     } else if raw.peak_rssi >= -68 {
@@ -405,7 +476,6 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
         "Fringe (>15m)".to_string()
     };
 
-    // Motion State based on RSSI spread during window
     let rssi_delta = (raw.peak_rssi - raw.min_rssi).abs();
     let motion = if raw.count == 1 {
         "Single Probe".to_string()
@@ -434,8 +504,11 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
         rssi_min: raw.min_rssi,
         ssid: raw.ssid,
         vendor: raw.vendor,
+        device_state: raw.device_state,
         wifi_gen: raw.wifi_gen,
         mimo: raw.mimo,
+        security: raw.security,
+        fp_hash: raw.fp_hash,
         channel: raw.channel,
         count: raw.count,
         seq_range,
@@ -444,7 +517,7 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.2.0 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.3.0 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     // Read config
@@ -469,7 +542,7 @@ fn main() {
 
     let cache: Arc<Mutex<HashMap<String, RawProbeRecord>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // 1. Channel Hopper Thread (hops channels 1, 6, 11)
+    // 1. Channel Hopper Thread
     let hopper_iface = iface.clone();
     thread::spawn(move || {
         let channels: [u8; 3] = [1, 6, 11];
@@ -485,7 +558,7 @@ fn main() {
         }
     });
 
-    // 2. Batch Sender Thread (flushes unique aggregated probes every 60s)
+    // 2. Batch Sender Thread
     let flush_cache = Arc::clone(&cache);
     let flush_url = webapp_url.clone();
     let flush_token = secret_token.clone();
@@ -574,8 +647,8 @@ fn main() {
             if let Some((rssi, ch, radiotap_len)) = parse_radiotap(&buf[..len]) {
                 if let Some((record, dedup_key)) = parse_probe_frame(&buf[..len], radiotap_len, rssi, ch) {
                     println!(
-                        "Probe: {} | Ch: {:2} | {:4} dBm | SSID: {:18} | Vendor: {:16} | {}",
-                        record.mac, record.channel, record.peak_rssi, record.ssid, record.vendor, record.wifi_gen
+                        "Probe: {} [FP:{}] | Ch:{:2} | {:4} dBm | State: {:18} | Sec: {:12} | SSID: {:14} | {}",
+                        record.mac, record.fp_hash, record.channel, record.peak_rssi, record.device_state, record.security, record.ssid, record.vendor
                     );
 
                     let mut lock = cache.lock().unwrap();

@@ -1,9 +1,9 @@
 [package]
 name = "probehound"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["fatjons"]
-description = "Lightweight, zero-disk-wear 802.11 probe request sniffer and RF proximity telemetry engine for edge devices"
+description = "Lightweight, zero-disk-wear 802.11 probe sniffer and RF proximity telemetry engine for edge devices"
 
 [dependencies]
 libc = "0.2"

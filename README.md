@@ -26,6 +26,9 @@ The core philosophy of ProbeHound:
   - `In Motion`: Delta RSSI >= 8 dBm (pedestrians, cyclists, vehicles)
   - `Stationary`: Delta RSSI < 8 dBm (stationary electronics, parked devices)
   - `Single Probe`: Isolated burst
+- **Device Fingerprint Hash ("Wi-Fi JA3"):** Computes an invariant 8-character FNV-1a hash of the device's ordered Information Elements and vendor tags. Allows linking and tracking the same physical device over multiple days or weeks despite MAC randomization.
+- **Apple & Device Screen State:** Identifies Apple Continuity / AirPort state flags inside `00:17:f2` to distinguish between `Screen On / Active` (user actively interacting with phone) versus `Screen Off / Sleep` (locked in pocket).
+- **Security & Roaming Capabilities:** Dissects IE 127 (Extended Capabilities) to extract `WPA3`, `PMF` (Protected Management Frames - 802.11w), and `802.11v` (BSS Transition).
 - **Deep Information Element (IE) Inspection:**
   - **WPS Device & Model Discovery:** Parses Microsoft WPS TLVs (`00:50:f2:04`) to extract plaintext device names, models, and manufacturers (e.g. *"Galaxy S21"*, *"HP DeskJet"*, *"Shelly Plus"*).
   - **Wi-Fi Generation Detection:** Identifies `Legacy 802.11b/g`, `Wi-Fi 4 (802.11n)`, `Wi-Fi 5 (802.11ac)`, and `Wi-Fi 6 (802.11ax)`.
@@ -53,6 +56,9 @@ The core philosophy of ProbeHound:
                              +--------------------------+
                              |   Radiotap / IE Parser   |
                              |   - RSSI & Channel       |
+                             |   - Fingerprint Hash     |
+                             |   - Apple Screen State   |
+                             |   - WPA3 / PMF / 802.11v |
                              |   - WPS Device & Vendor  |
                              |   - Wi-Fi Gen & MIMO     |
                              +--------------------------+
@@ -94,8 +100,11 @@ ProbeHound pushes batched JSON arrays to your webhook endpoint:
       "rssi_min": -72,
       "ssid": "<Broadcast>",
       "vendor": "Apple iOS / macOS",
+      "device_state": "Screen On / Active",
       "wifi_gen": "Wi-Fi 6 (802.11ax)",
       "mimo": "2x2 MIMO",
+      "security": "WPA3/PMF/802.11v",
+      "fp_hash": "a4f81c9e",
       "channel": 6,
       "count": 7,
       "seq_range": "1042 -> 1049"
@@ -169,8 +178,9 @@ docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
 ## Offline Analysis in Google Sheets
 
 By piping raw batches into Google Sheets via Google Apps Script, you decouple capture from analysis:
-- Track peak hours of pedestrian traffic past your property.
-- Identify recurring MAC address sequence bursts or known SSIDs.
+- Correlate visitors using `fp_hash` across randomized MAC addresses.
+- Distinguish active smartphone use (`Screen On / Active`) from passive devices in pockets or cars.
+- Filter for WPA3 / PMF capable devices versus legacy IoT devices.
 - Query historical presence without querying local homelab hardware or spinning up database containers.
 
 ---
