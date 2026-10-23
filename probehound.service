@@ -1,0 +1,17 @@
+[Unit]
+Description=ProbeHound 802.11 Soft Perimeter Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/rfkill unblock all
+ExecStartPre=-/usr/sbin/ip link set wlan0 down
+ExecStartPre=/usr/sbin/iw dev wlan0 set type monitor
+ExecStartPre=/usr/sbin/ip link set wlan0 up
+ExecStart=/usr/local/bin/probehound
+Restart=always
+RestartSec=5
+Environment=SNIFFER_IFACE=wlan0
+
+[Install]
+WantedBy=multi-user.target

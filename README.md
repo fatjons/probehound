@@ -1,6 +1,6 @@
 # ProbeHound (`probehound`)
 
-> **Near-zero resource, zero-maintenance 802.11 soft perimeter monitor for homelabs and edge devices**
+> **Near-zero resource, bounded-memory 802.11 soft perimeter monitor for homelabs and edge devices**
 
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
 [![Target](https://img.shields.io/badge/arch-ARMv6%20%7C%20ARMv7%20%7C%20aarch64%20%7C%20x86__64-blue.svg)](https://github.com/fatjons/probehound)
@@ -8,35 +8,36 @@
 
 ProbeHound is a lightweight background daemon designed for homelabs and edge nodes (such as a Raspberry Pi 1 B+, Pi Zero, or thin client) equipped with a monitor-mode Wi-Fi dongle. It acts as a passive **soft perimeter monitor**, capturing 802.11 probe requests broadcast by smartphones, wearables, vehicles, and smart devices in the vicinity.
 
-The core philosophy of ProbeHound:
-1. **Near-Zero Resource & Zero Maintenance:** Runs as an ultra-lean compiled binary (~3 MB RAM, negligible CPU) that can run indefinitely in the background without attention or database administration.
-2. **Zero Disk Wear (Flash Safe):** No local SQLite or write-heavy databases. All frame inspection, deduplication, and windowing occur strictly in RAM, preventing flash/SD card wear on edge hardware.
-3. **Decoupled Offline Analysis:** Telemetry is periodically flushed in batches directly to a cloud webhook (such as Google Sheets). You can filter, graph, and analyze perimeter activity offline at any time without consuming homelab CPU or storage.
+### Core Design Principles
+1. **Near-Zero Resource & Zero Maintenance:** Runs as a small statically linked binary (~3 MB RAM, negligible CPU) with quiet default logging (`DEBUG_PROBES=0`) to avoid journald write amplification.
+2. **Bounded In-Memory Operation:** No local SQLite or write-heavy disk databases. Frame inspection, per-channel aggregation (`MAC + SSID + Channel`), and retry queueing occur strictly in bounded RAM (`MAX_ACTIVE_RECORDS = 1024`, `MAX_QUEUED_BATCHES = 15`).
+3. **Decoupled Offline Analysis:** Telemetry is periodically flushed in bounded batches to a cloud webhook (such as Google Sheets) with HTTP timeouts and automatic retry queueing on transient network failures.
 
 ---
 
 ## Core Capabilities
 
-- **Qualitative Proximity Zones:** Mitigates raw RSSI noise and device transmit power differences by categorizing signals into calibrated proximity zones:
-  - `Immediate (<3m)`: Peak RSSI >= -50 dBm (same room or immediate perimeter)
-  - `Near (3-8m)`: -68 dBm <= Peak RSSI < -50 dBm (adjacent room or driveway)
-  - `Mid-Range (8-15m)`: -79 dBm <= Peak RSSI < -68 dBm (curbside or garden)
-  - `Fringe (>15m)`: Peak RSSI < -80 dBm (passersby or distant devices)
-- **Motion & Velocity Dynamics:** Compares maximum and minimum signal strength over the batch interval to detect whether a device is moving past or stationary:
-  - `In Motion`: Delta RSSI >= 8 dBm (pedestrians, cyclists, vehicles)
-  - `Stationary`: Delta RSSI < 8 dBm (stationary electronics, parked devices)
-  - `Single Probe`: Isolated burst
-- **Device Fingerprint Hash ("Wi-Fi JA3"):** Computes an invariant 8-character FNV-1a hash of the device's ordered Information Elements and vendor tags. Allows linking and tracking the same physical device over multiple days or weeks despite MAC randomization.
-- **Apple & Device Screen State:** Identifies Apple Continuity / AirPort state flags inside `00:17:f2` to distinguish between `Screen On / Active` (user actively interacting with phone) versus `Screen Off / Sleep` (locked in pocket).
-- **Security & Roaming Capabilities:** Dissects IE 127 (Extended Capabilities) to extract `WPA3`, `PMF` (Protected Management Frames - 802.11w), and `802.11v` (BSS Transition).
+- **Strict Radiotap & FCS Validation:**
+  - Parses Radiotap headers strictly according to field alignment rules without guessing bytes; reports `None` (`Unknown RSSI`) if the antenna signal bit is absent.
+  - Rejects frames marked with `BADFCS` (`0x40`) and strips trailing 4-byte `FCS` (`0x10`) prior to Information Element parsing so frame checksums never pollute IE tags.
+- **Per-Channel Signal Bands & Spread:**
+  - Aggregates observations per `(MAC, SSID, Channel)` tuple so cross-channel antenna variations do not distort signal metrics:
+    - `Strong (>= -50 dBm)`
+    - `Moderate (-51..-68 dBm)`
+    - `Weak (-69..-79 dBm)`
+    - `Very Weak (<= -80 dBm)`
+  - Computes intra-window **RSSI Spread** ($\text{RSSI}_{\max} - \text{RSSI}_{\min}$):
+    - `High Spread (>=8 dB)`: Significant signal variation during the window.
+    - `Low Spread (<8 dB)`: Stable signal level.
+    - `Single Probe`: Single observation in the window.
+- **Capability Pattern Fingerprint (`fp_hash`):**
+  - Computes an 8-character FNV-1a hash over the ordered IE tag sequence, Supported/Extended Rates (Tags 1, 50), HT/VHT capability headers (Tags 45, 191), Extended Capabilities (Tag 127), Extension IDs (Tag 255), and Vendor OUIs (Tag 221).
+  - Represents a device's driver/OS capability profile, helping correlate recurring capability classes across randomized MAC addresses.
 - **Deep Information Element (IE) Inspection:**
-  - **WPS Device & Model Discovery:** Parses Microsoft WPS TLVs (`00:50:f2:04`) to extract plaintext device names, models, and manufacturers (e.g. *"Galaxy S21"*, *"HP DeskJet"*, *"Shelly Plus"*).
-  - **Wi-Fi Generation Detection:** Identifies `Legacy 802.11b/g`, `Wi-Fi 4 (802.11n)`, `Wi-Fi 5 (802.11ac)`, and `Wi-Fi 6 (802.11ax)`.
-  - **Spatial Streams (MIMO):** Detects `2x2 MIMO` vs `1x1 SISO` support via HT/VHT MCS bitmasks.
-  - **Vendor Tagging:** Identifies Apple Continuity (`00:17:f2`), Microsoft (`00:50:f2`), Broadcom (`00:90:4c`), Google (`00:1a:11`), and Espressif IoT tags.
-  - **MAC Type Detection:** Flags randomized/private MAC addresses versus factory hardware OUIs.
-  - **Sequence Control Correlation:** Tracks hardware sequence number ranges (`seq_start -> seq_end`) to correlate probe bursts across randomized MAC addresses.
-- **Built-in Channel Hopper:** Rotates across the primary 2.4 GHz channels (1, 6, 11) using low-overhead timer intervals.
+  - **Probe Type:** Distinguishes `Directed` (explicit target SSID) vs `Broadcast` (wildcard scan).
+  - **Protocol & Roaming Capabilities:** Detects `802.11k` (RM, Tag 70), `802.11u` (Interworking, Tag 107), `802.11v` (BSS Transition, Tag 127), `UTF8-SSID`, and `WPS`.
+  - **WPS Device & Model Discovery:** Parses Microsoft WPS TLVs (`00:50:f2:04`) to extract plaintext device names, models, and manufacturers.
+  - **Wi-Fi Generation & Spatial Streams:** Identifies `Legacy 802.11b/g`, `Wi-Fi 4 (802.11n)`, `Wi-Fi 5 (802.11ac)`, and `Wi-Fi 6 (802.11ax)`, and decodes both HT RX MCS bitmasks and VHT RX MCS maps for `2x2 MIMO` vs `1x1 SISO`.
 
 ---
 
@@ -55,18 +56,16 @@ The core philosophy of ProbeHound:
                                           v
                              +--------------------------+
                              |   Radiotap / IE Parser   |
-                             |   - RSSI & Channel       |
-                             |   - Fingerprint Hash     |
-                             |   - Apple Screen State   |
-                             |   - WPA3 / PMF / 802.11v |
-                             |   - WPS Device & Vendor  |
-                             |   - Wi-Fi Gen & MIMO     |
+                             |   - Strict RSSI & FCS    |
+                             |   - Capability Hash      |
+                             |   - 802.11k/u/v & WPS    |
+                             |   - HT/VHT MIMO Decode   |
                              +--------------------------+
                                           |
                                           v
                              +--------------------------+
-                             | In-Memory Ring Buffer    |
-                             | Deduplication & Motion   |
+                             | Bounded In-Memory Map    |
+                             | & Retry Batch Queue      |
                              +--------------------------+
                                           | (every 60s)
                                           v
@@ -92,18 +91,18 @@ ProbeHound pushes batched JSON arrays to your webhook endpoint:
       "mac": "da:a1:19:34:56:78",
       "mac_type": "Randomized",
       "is_random": true,
-      "proximity": "Near (3-8m)",
-      "motion": "In Motion",
-      "rssi": -62,
-      "rssi_peak": -62,
+      "proximity": "Moderate (-51..-68 dBm)",
+      "motion": "High Spread (>=8 dB)",
+      "rssi": -60,
+      "rssi_peak": -60,
       "rssi_avg": -66,
       "rssi_min": -72,
       "ssid": "<Broadcast>",
-      "vendor": "Apple iOS / macOS",
-      "device_state": "Screen On / Active",
+      "vendor": "Apple",
+      "device_state": "Broadcast",
       "wifi_gen": "Wi-Fi 6 (802.11ax)",
       "mimo": "2x2 MIMO",
-      "security": "WPA3/PMF/802.11v",
+      "security": "802.11k/802.11v",
       "fp_hash": "a4f81c9e",
       "channel": 6,
       "count": 7,
@@ -115,13 +114,11 @@ ProbeHound pushes batched JSON arrays to your webhook endpoint:
 
 ---
 
-## Building and Deployment
+## Building, Testing, and Deployment
 
-ProbeHound has zero runtime external library dependencies. It links statically with musl libc.
-
-### Native Build (x86_64)
+### Run Unit Tests
 ```bash
-cargo build --release
+cargo test
 ```
 
 ### Cross-Compilation for ARMv6 (Raspberry Pi 1 B+, Pi Zero)
@@ -134,54 +131,6 @@ docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
   cargo build --release --target arm-unknown-linux-musleabihf
 '
 ```
-
-### Systemd Service Setup
-
-1. Copy the static binary:
-   ```bash
-   sudo cp target/arm-unknown-linux-musleabihf/release/probehound /usr/local/bin/probehound
-   sudo chmod +x /usr/local/bin/probehound
-   ```
-
-2. Enable monitor mode on your adapter:
-   ```bash
-   sudo ip link set wlan0 down
-   sudo iw dev wlan0 set type monitor
-   sudo ip link set wlan0 up
-   ```
-
-3. Create `/etc/systemd/system/probehound.service`:
-   ```ini
-   [Unit]
-   Description=ProbeHound 802.11 Soft Perimeter Monitor
-   After=network.target
-
-   [Service]
-   Type=simple
-   ExecStart=/usr/local/bin/probehound
-   Restart=always
-   RestartSec=5
-   Environment=SNIFFER_IFACE=wlan0
-
-   [Install]
-   WantedBy=multi-user.target
-   ```
-
-4. Start and enable:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now probehound
-   ```
-
----
-
-## Offline Analysis in Google Sheets
-
-By piping raw batches into Google Sheets via Google Apps Script, you decouple capture from analysis:
-- Correlate visitors using `fp_hash` across randomized MAC addresses.
-- Distinguish active smartphone use (`Screen On / Active`) from passive devices in pockets or cars.
-- Filter for WPA3 / PMF capable devices versus legacy IoT devices.
-- Query historical presence without querying local homelab hardware or spinning up database containers.
 
 ---
 
