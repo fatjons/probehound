@@ -1,41 +1,43 @@
-# 📡 ProbeHound (`probehound`)
+# ProbeHound (`probehound`)
 
-> **Lightweight, Zero-Disk-Wear 802.11 Probe Request Sniffer & RF Proximity Telemetry Engine for Edge Devices**
+> **Near-zero resource, zero-maintenance 802.11 soft perimeter monitor for homelabs and edge devices**
 
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
-[![Target](https://img.shields.io/badge/arch-ARMv6%20%7C%20ARMv7%20%7C%20aarch64%20%7C%20x86__64-blue.svg)]()
+[![Target](https://img.shields.io/badge/arch-ARMv6%20%7C%20ARMv7%20%7C%20aarch64%20%7C%20x86__64-blue.svg)](https://github.com/fatjons/probehound)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**ProbeHound** turns any low-power Single Board Computer (such as an ultra-constrained Raspberry Pi 1 B+ or Pi Zero) equipped with a monitor-mode Wi-Fi adapter (e.g. Atheros AR9271 / TP-Link TL-WN722N v1) into an always-on, high-resolution Wi-Fi presence and proximity sensor.
+ProbeHound is a lightweight background daemon designed for homelabs and edge nodes (such as a Raspberry Pi 1 B+, Pi Zero, or thin client) equipped with a monitor-mode Wi-Fi dongle. It acts as a passive **soft perimeter monitor**, capturing 802.11 probe requests broadcast by smartphones, wearables, vehicles, and smart devices in the vicinity.
 
-It monitors 802.11 broadcast management frames (Probe Requests) emitted by smartphones, laptops, wearables, and IoT appliances, extracting deep RF and physical layer telemetry. All processing and deduplication happens strictly in **RAM** to guarantee **zero disk wear** on flash memory, flushing batched JSON payloads periodically to your cloud webhook or Google Sheets.
+The core philosophy of ProbeHound:
+1. **Near-Zero Resource & Zero Maintenance:** Runs as an ultra-lean compiled binary (~3 MB RAM, negligible CPU) that can run indefinitely in the background without attention or database administration.
+2. **Zero Disk Wear (Flash Safe):** No local SQLite or write-heavy databases. All frame inspection, deduplication, and windowing occur strictly in RAM, preventing flash/SD card wear on edge hardware.
+3. **Decoupled Offline Analysis:** Telemetry is periodically flushed in batches directly to a cloud webhook (such as Google Sheets). You can filter, graph, and analyze perimeter activity offline at any time without consuming homelab CPU or storage.
 
 ---
 
-## ✨ Key Features
+## Core Capabilities
 
-- **⚡ Zero Disk Wear (Flash Safe):** No SQLite or local disk logging. In-flight packets are aggregated and deduplicated in RAM and flushed to cloud webhooks in periodic batches (e.g. every 60s).
-- **📶 Qualitative Proximity Zones:** Mitigates raw RSSI noise and path-loss disparity by classifying devices into calibrated proximity zones:
-  - `Immediate (<3m)`: $\text{RSSI} \ge -50\text{ dBm}$
-  - `Near (3-8m)`: $-68\text{ dBm} \le \text{RSSI} < -50\text{ dBm}$
-  - `Mid-Range (8-15m)`: $-79\text{ dBm} \le \text{RSSI} < -68\text{ dBm}$
-  - `Fringe (>15m)`: $\text{RSSI} < -80\text{ dBm}$
-- **🏃 Motion & Velocity Detection:** Analyzes RSSI spread ($\Delta\text{RSSI} = \text{RSSI}_{\max} - \text{RSSI}_{\min}$) over the batch window to distinguish between:
-  - `In Motion`: Fast-moving pedestrians or vehicles passing by ($\Delta\text{RSSI} \ge 8\text{ dBm}$).
-  - `Stationary`: Stable devices resting on tables or stationary smart home appliances ($\Delta\text{RSSI} < 8\text{ dBm}$).
-- **🔍 Deep Information Element (IE) Inspection:**
-  - **WPS Device & Model Extraction:** Dissects Microsoft WPS TLVs (`00:50:f2:04`) to recover plaintext Device Names, Model Names, and Manufacturers (e.g., *"Galaxy S21"*, *"HP DeskJet"*, *"Shelly Plus"*).
+- **Qualitative Proximity Zones:** Mitigates raw RSSI noise and device transmit power differences by categorizing signals into calibrated proximity zones:
+  - `Immediate (<3m)`: Peak RSSI >= -50 dBm (same room or immediate perimeter)
+  - `Near (3-8m)`: -68 dBm <= Peak RSSI < -50 dBm (adjacent room or driveway)
+  - `Mid-Range (8-15m)`: -79 dBm <= Peak RSSI < -68 dBm (curbside or garden)
+  - `Fringe (>15m)`: Peak RSSI < -80 dBm (passersby or distant devices)
+- **Motion & Velocity Dynamics:** Compares maximum and minimum signal strength over the batch interval to detect whether a device is moving past or stationary:
+  - `In Motion`: Delta RSSI >= 8 dBm (pedestrians, cyclists, vehicles)
+  - `Stationary`: Delta RSSI < 8 dBm (stationary electronics, parked devices)
+  - `Single Probe`: Isolated burst
+- **Deep Information Element (IE) Inspection:**
+  - **WPS Device & Model Discovery:** Parses Microsoft WPS TLVs (`00:50:f2:04`) to extract plaintext device names, models, and manufacturers (e.g. *"Galaxy S21"*, *"HP DeskJet"*, *"Shelly Plus"*).
   - **Wi-Fi Generation Detection:** Identifies `Legacy 802.11b/g`, `Wi-Fi 4 (802.11n)`, `Wi-Fi 5 (802.11ac)`, and `Wi-Fi 6 (802.11ax)`.
-  - **MIMO Stream Capabilities:** Detects `2x2 MIMO` vs `1x1 SISO` spatial streams via HT/VHT MCS bitmasks.
+  - **Spatial Streams (MIMO):** Detects `2x2 MIMO` vs `1x1 SISO` support via HT/VHT MCS bitmasks.
   - **Vendor Tagging:** Identifies Apple Continuity (`00:17:f2`), Microsoft (`00:50:f2`), Broadcom (`00:90:4c`), Google (`00:1a:11`), and Espressif IoT tags.
-  - **MAC Randomization Flag:** Detects locally administered MAC addresses vs factory OUIs.
-  - **Sequence Control Correlation:** Tracks hardware sequence number ranges (`seq_start -> seq_end`) to correlate probe bursts even across randomized addresses.
-- **🔄 Channel Hopping:** Built-in lightweight multi-threaded 2.4 GHz channel hopper (Channels 1, 6, 11).
-- **🪶 Ultra Lean:** Consumes less than 4 MB of RAM and ~1% CPU on a 700MHz single-core ARMv6 CPU.
+  - **MAC Type Detection:** Flags randomized/private MAC addresses versus factory hardware OUIs.
+  - **Sequence Control Correlation:** Tracks hardware sequence number ranges (`seq_start -> seq_end`) to correlate probe bursts across randomized MAC addresses.
+- **Built-in Channel Hopper:** Rotates across the primary 2.4 GHz channels (1, 6, 11) using low-overhead timer intervals.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
                        +---------------------------------------+
@@ -57,21 +59,22 @@ It monitors 802.11 broadcast management frames (Probe Requests) emitted by smart
                                           |
                                           v
                              +--------------------------+
-                             | In-Memory Deduplication  |
-                             | & Motion / Range Window  |
+                             | In-Memory Ring Buffer    |
+                             | Deduplication & Motion   |
                              +--------------------------+
                                           | (every 60s)
                                           v
                              +--------------------------+
-                             | HTTPS Webhook / GSheets  |
+                             | Webhook (Google Sheets)  |
+                             |   for Offline Analysis   |
                              +--------------------------+
 ```
 
 ---
 
-## 📊 Telemetry Schema
+## Telemetry Payload Schema
 
-ProbeHound outputs structured JSON batches:
+ProbeHound pushes batched JSON arrays to your webhook endpoint:
 
 ```json
 {
@@ -103,16 +106,16 @@ ProbeHound outputs structured JSON batches:
 
 ---
 
-## 🚀 Building & Cross-Compilation
+## Building and Deployment
 
-ProbeHound is self-contained with no external C library dependencies (uses pure static musl libc).
+ProbeHound has zero runtime external library dependencies. It links statically with musl libc.
 
-### Native Build (x86_64 / Desktop)
+### Native Build (x86_64)
 ```bash
 cargo build --release
 ```
 
-### Cross-Compiling for Raspberry Pi 1 B+ / Pi Zero (ARMv6 musl)
+### Cross-Compilation for ARMv6 (Raspberry Pi 1 B+, Pi Zero)
 Using Docker:
 ```bash
 docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
@@ -123,27 +126,25 @@ docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
 '
 ```
 
----
+### Systemd Service Setup
 
-## ⚙️ Deployment & Systemd Service
-
-1. Copy the compiled binary to `/usr/local/bin/probehound`:
+1. Copy the static binary:
    ```bash
    sudo cp target/arm-unknown-linux-musleabihf/release/probehound /usr/local/bin/probehound
    sudo chmod +x /usr/local/bin/probehound
    ```
 
-2. Put your Wi-Fi interface into monitor mode:
+2. Enable monitor mode on your adapter:
    ```bash
    sudo ip link set wlan0 down
    sudo iw dev wlan0 set type monitor
    sudo ip link set wlan0 up
    ```
 
-3. Configure `/etc/systemd/system/probehound.service`:
+3. Create `/etc/systemd/system/probehound.service`:
    ```ini
    [Unit]
-   Description=ProbeHound 802.11 Wi-Fi Telemetry Sniffer
+   Description=ProbeHound 802.11 Soft Perimeter Monitor
    After=network.target
 
    [Service]
@@ -157,7 +158,7 @@ docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
    WantedBy=multi-user.target
    ```
 
-4. Enable and start:
+4. Start and enable:
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable --now probehound
@@ -165,5 +166,15 @@ docker run --rm -v $(pwd):/app -w /app rust:slim bash -c '
 
 ---
 
-## 📄 License
-MIT License. Created by [fatjons](https://github.com/fatjons).
+## Offline Analysis in Google Sheets
+
+By piping raw batches into Google Sheets via Google Apps Script, you decouple capture from analysis:
+- Track peak hours of pedestrian traffic past your property.
+- Identify recurring MAC address sequence bursts or known SSIDs.
+- Query historical presence without querying local homelab hardware or spinning up database containers.
+
+---
+
+## License
+
+MIT License. Developed by [fatjons](https://github.com/fatjons).
