@@ -1,0 +1,19 @@
+[package]
+name = "probehound"
+version = "0.2.0"
+edition = "2021"
+authors = ["fatjons"]
+description = "Lightweight, zero-disk-wear 802.11 probe request sniffer and RF proximity telemetry engine for edge devices"
+
+[dependencies]
+libc = "0.2"
+ureq = { version = "2.9", default-features = false, features = ["tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
