@@ -71,11 +71,17 @@ struct EnrichedProbe {
 }
 
 #[derive(Serialize)]
-struct BatchPayload {
+struct BatchPayload<'a> {
     token: String,
     #[serde(rename = "type")]
     msg_type: &'static str,
-    items: Vec<EnrichedProbe>,
+    items: &'a [EnrichedProbe],
+}
+
+fn push_accepted(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|v| v["status"] == "probes_saved")
+        .unwrap_or(false)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -578,7 +584,7 @@ fn ingest_probe(
 
 fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
     let avg_rssi = if raw.rssi_count > 0 {
-        Some((raw.rssi_sum / raw.rssi_count as i32) as i8)
+        Some((raw.rssi_sum as f32 / raw.rssi_count as f32).round() as i8)
     } else {
         None
     };
@@ -636,7 +642,7 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.4.0 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.4.1 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -755,7 +761,7 @@ fn main() {
                 let payload = BatchPayload {
                     token: flush_token.clone(),
                     msg_type: "probes",
-                    items: items_to_send.clone(),
+                    items: &items_to_send,
                 };
 
                 match agent
@@ -764,7 +770,17 @@ fn main() {
                     .send_json(&payload)
                 {
                     Ok(resp) => {
-                        println!("[*] Webhook Push Status: {}", resp.status());
+                        let status = resp.status();
+                        let body = resp.into_string().unwrap_or_default();
+                        if !push_accepted(&body) {
+                            eprintln!(
+                                "[!] Webhook Push Rejected (re-queueing batch): {}",
+                                body.chars().take(200).collect::<String>()
+                            );
+                            retry_queue.push_front(items_to_send);
+                            break;
+                        }
+                        println!("[*] Webhook Push Status: {}", status);
                     }
                     Err(e) => {
                         eprintln!("[!] Webhook Push Failed (re-queueing batch): {}", e);
@@ -807,7 +823,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.4.0 active in monitor mode...");
+        println!("[*] ProbeHound v0.4.1 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1012,5 +1028,14 @@ mod tests {
         let fin = finalize_record(rec);
         assert_eq!(fin.rssi_peak, None);
         assert_eq!(fin.proximity, "Unknown RSSI");
+    }
+
+    #[test]
+    fn test_push_accepted() {
+        assert!(push_accepted(r#"{"status":"probes_saved","count":3}"#));
+        assert!(!push_accepted(r#"{"status":"forbidden"}"#));
+        assert!(!push_accepted(r#"{"error":"x"}"#));
+        assert!(!push_accepted("<html>"));
+        assert!(!push_accepted(""));
     }
 }
