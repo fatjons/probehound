@@ -15,6 +15,7 @@ static CURRENT_CHANNEL: AtomicU8 = AtomicU8::new(1);
 const MAX_ACTIVE_RECORDS: usize = 1024;
 const MAX_QUEUED_BATCHES: usize = 15;
 const MAX_ITEMS_PER_POST: usize = 250;
+const MAX_BEACON_BSSIDS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AggregationKey {
@@ -70,17 +71,41 @@ struct EnrichedProbe {
     seq_range: String,
 }
 
+struct BeaconStat {
+    ssid: String,
+    channel: u8,
+    rssi_sum: i32,
+    n: u32,
+    min: i8,
+    max: i8,
+}
+
+/// [bssid, ssid, channel, mean rssi, min, max, n] serialized as a JSON array
+type BeaconItem = (String, String, u8, f32, i8, i8, u32);
+
+struct BeaconBatch {
+    time: String,
+    items: Vec<BeaconItem>,
+}
+
+enum Batch {
+    Probes(Vec<EnrichedProbe>),
+    Beacons(BeaconBatch),
+}
+
 #[derive(Serialize)]
-struct BatchPayload<'a> {
+struct BatchPayload<'a, T> {
     token: String,
     #[serde(rename = "type")]
     msg_type: &'static str,
-    items: &'a [EnrichedProbe],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time: Option<&'a str>,
+    items: &'a [T],
 }
 
-fn push_accepted(body: &str) -> bool {
+fn push_accepted(body: &str, expected_status: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
-        .map(|v| v["status"] == "probes_saved")
+        .map(|v| v["status"] == expected_status)
         .unwrap_or(false)
 }
 
@@ -303,12 +328,8 @@ fn parse_wps_vendor(tag_data: &[u8]) -> Option<String> {
     }
 }
 
-/// Parses 802.11 Probe Request Frame & Information Elements
-fn parse_probe_frame(
-    buf: &[u8],
-    rtap: &RadiotapInfo,
-    now_secs: u64,
-) -> Option<(RawProbeRecord, AggregationKey)> {
+/// Returns the 802.11 frame (radiotap and FCS stripped), rejecting bad-FCS or short frames
+fn extract_frame<'a>(buf: &'a [u8], rtap: &RadiotapInfo) -> Option<&'a [u8]> {
     if rtap.bad_fcs || buf.len() <= rtap.header_len {
         return None;
     }
@@ -327,6 +348,16 @@ fn parse_probe_frame(
     if frame.len() < 24 {
         return None;
     }
+    Some(frame)
+}
+
+/// Parses 802.11 Probe Request Frame & Information Elements
+fn parse_probe_frame(
+    buf: &[u8],
+    rtap: &RadiotapInfo,
+    now_secs: u64,
+) -> Option<(RawProbeRecord, AggregationKey)> {
+    let frame = extract_frame(buf, rtap)?;
 
     // Byte 0: Frame Control (Type = 0 Management, Subtype = 4 Probe Request -> 0x40)
     if (frame[0] & 0xfc) != 0x40 {
@@ -582,6 +613,86 @@ fn ingest_probe(
     }
 }
 
+/// Parses a Beacon into (bssid, ssid, ap channel, rssi); None if not a usable beacon
+fn parse_beacon_frame(buf: &[u8], rtap: &RadiotapInfo) -> Option<([u8; 6], String, u8, i8)> {
+    let frame = extract_frame(buf, rtap)?;
+    // Type 0 Management, Subtype 8 Beacon -> 0x80; fixed fields end at offset 36
+    if (frame[0] & 0xfc) != 0x80 || frame.len() < 36 {
+        return None;
+    }
+    let rssi = rtap.rssi?;
+    let mut bssid = [0u8; 6];
+    bssid.copy_from_slice(&frame[16..22]);
+
+    let mut ssid = String::new();
+    let mut ds_channel: Option<u8> = None;
+    let mut offset = 36;
+    while offset + 2 <= frame.len() {
+        let tag_num = frame[offset];
+        let tag_len = frame[offset + 1] as usize;
+        offset += 2;
+        if offset + tag_len > frame.len() {
+            break;
+        }
+        let tag_data = &frame[offset..offset + tag_len];
+        match tag_num {
+            0 => {
+                if let Ok(s) = std::str::from_utf8(tag_data) {
+                    ssid = s.chars().filter(|c| !c.is_control()).collect();
+                }
+            }
+            3 if tag_len == 1 => ds_channel = Some(tag_data[0]),
+            _ => {}
+        }
+        offset += tag_len;
+    }
+
+    // Adjacent-channel leakage gives attenuated, misleading RSSI
+    if ds_channel.map_or(false, |c| c != rtap.channel) {
+        return None;
+    }
+    if ssid.is_empty() {
+        ssid = "<Hidden>".to_string();
+    }
+    Some((bssid, ssid, rtap.channel, rssi))
+}
+
+/// Aggregates a beacon observation into the bounded per-BSSID map
+fn ingest_beacon(
+    map: &mut HashMap<[u8; 6], BeaconStat>,
+    bssid: [u8; 6],
+    ssid: String,
+    channel: u8,
+    rssi: i8,
+) -> bool {
+    let is_full = map.len() >= MAX_BEACON_BSSIDS;
+    match map.entry(bssid) {
+        Entry::Occupied(mut occ) => {
+            let e = occ.get_mut();
+            e.rssi_sum += rssi as i32;
+            e.n += 1;
+            e.min = e.min.min(rssi);
+            e.max = e.max.max(rssi);
+            true
+        }
+        Entry::Vacant(vac) => {
+            if is_full {
+                false
+            } else {
+                vac.insert(BeaconStat {
+                    ssid,
+                    channel,
+                    rssi_sum: rssi as i32,
+                    n: 1,
+                    min: rssi,
+                    max: rssi,
+                });
+                true
+            }
+        }
+    }
+}
+
 fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
     let avg_rssi = if raw.rssi_count > 0 {
         Some((raw.rssi_sum as f32 / raw.rssi_count as f32).round() as i8)
@@ -642,7 +753,7 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.4.1 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.5.0 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -673,6 +784,8 @@ fn main() {
 
     let cache: Arc<Mutex<HashMap<AggregationKey, RawProbeRecord>>> =
         Arc::new(Mutex::new(HashMap::with_capacity(256)));
+    let beacon_cache: Arc<Mutex<HashMap<[u8; 6], BeaconStat>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // 1. Channel Hopper Thread (only updates fallback channel on successful iw execution)
     let hopper_iface = iface.clone();
@@ -699,6 +812,7 @@ fn main() {
 
     // 2. Bounded Batch Sender Thread with Retry Queue & Timeouts
     let flush_cache = Arc::clone(&cache);
+    let flush_beacons = Arc::clone(&beacon_cache);
     let flush_url = webapp_url.clone();
     let flush_token = secret_token.clone();
     thread::spawn(move || {
@@ -708,7 +822,7 @@ fn main() {
             .timeout_write(Duration::from_secs(15))
             .build();
 
-        let mut retry_queue: VecDeque<Vec<EnrichedProbe>> = VecDeque::new();
+        let mut retry_queue: VecDeque<Batch> = VecDeque::new();
         let mut dropped_batches: u64 = 0;
 
         loop {
@@ -733,7 +847,7 @@ fn main() {
                             retry_queue.pop_front();
                             dropped_batches += 1;
                         }
-                        retry_queue.push_back(std::mem::take(&mut batch));
+                        retry_queue.push_back(Batch::Probes(std::mem::take(&mut batch)));
                     }
                 }
                 if !batch.is_empty() {
@@ -741,8 +855,27 @@ fn main() {
                         retry_queue.pop_front();
                         dropped_batches += 1;
                     }
-                    retry_queue.push_back(batch);
+                    retry_queue.push_back(Batch::Probes(batch));
                 }
+            }
+
+            let drained_beacons = std::mem::take(&mut *flush_beacons.lock().unwrap());
+            if !drained_beacons.is_empty() {
+                let items = drained_beacons
+                    .into_iter()
+                    .map(|(bssid, b)| {
+                        let mean = (b.rssi_sum as f32 / b.n as f32 * 10.0).round() / 10.0;
+                        (format_mac(&bssid), b.ssid, b.channel, mean, b.min, b.max, b.n)
+                    })
+                    .collect();
+                if retry_queue.len() >= MAX_QUEUED_BATCHES {
+                    retry_queue.pop_front();
+                    dropped_batches += 1;
+                }
+                retry_queue.push_back(Batch::Beacons(BeaconBatch {
+                    time: get_epoch_secs().to_string(),
+                    items,
+                }));
             }
 
             if retry_queue.is_empty() || flush_url.is_empty() {
@@ -753,26 +886,43 @@ fn main() {
                 println!(
                     "[{}] Pushing batch ({} groups, {} queued, {} dropped_total)...",
                     get_epoch_secs(),
-                    items_to_send.len(),
+                    match &items_to_send {
+                        Batch::Probes(v) => v.len(),
+                        Batch::Beacons(b) => b.items.len(),
+                    },
                     retry_queue.len(),
                     dropped_batches
                 );
 
-                let payload = BatchPayload {
-                    token: flush_token.clone(),
-                    msg_type: "probes",
-                    items: &items_to_send,
+                let req = agent
+                    .post(&flush_url)
+                    .set("Content-Type", "application/json");
+                let (expected, result) = match &items_to_send {
+                    Batch::Probes(v) => (
+                        "probes_saved",
+                        req.send_json(&BatchPayload {
+                            token: flush_token.clone(),
+                            msg_type: "probes",
+                            time: None,
+                            items: v,
+                        }),
+                    ),
+                    Batch::Beacons(b) => (
+                        "beacons_saved",
+                        req.send_json(&BatchPayload {
+                            token: flush_token.clone(),
+                            msg_type: "beacons",
+                            time: Some(&b.time),
+                            items: &b.items,
+                        }),
+                    ),
                 };
 
-                match agent
-                    .post(&flush_url)
-                    .set("Content-Type", "application/json")
-                    .send_json(&payload)
-                {
+                match result {
                     Ok(resp) => {
                         let status = resp.status();
                         let body = resp.into_string().unwrap_or_default();
-                        if !push_accepted(&body) {
+                        if !push_accepted(&body, expected) {
                             eprintln!(
                                 "[!] Webhook Push Rejected (re-queueing batch): {}",
                                 body.chars().take(200).collect::<String>()
@@ -823,7 +973,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.4.1 active in monitor mode...");
+        println!("[*] ProbeHound v0.5.0 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -868,6 +1018,20 @@ fn main() {
 
                     let mut lock = cache.lock().unwrap();
                     let _ = ingest_probe(&mut lock, key, record);
+                } else if let Some((bssid, ssid, channel, rssi)) =
+                    parse_beacon_frame(&buf[..len], &rtap)
+                {
+                    if debug_probes {
+                        println!(
+                            "Beacon: {} | Ch:{:2} | {} dBm | SSID: {}",
+                            format_mac(&bssid),
+                            channel,
+                            rssi,
+                            ssid
+                        );
+                    }
+                    let mut lock = beacon_cache.lock().unwrap();
+                    let _ = ingest_beacon(&mut lock, bssid, ssid, channel, rssi);
                 }
             }
         }
@@ -1032,10 +1196,71 @@ mod tests {
 
     #[test]
     fn test_push_accepted() {
-        assert!(push_accepted(r#"{"status":"probes_saved","count":3}"#));
-        assert!(!push_accepted(r#"{"status":"forbidden"}"#));
-        assert!(!push_accepted(r#"{"error":"x"}"#));
-        assert!(!push_accepted("<html>"));
-        assert!(!push_accepted(""));
+        assert!(push_accepted(r#"{"status":"probes_saved","count":3}"#, "probes_saved"));
+        assert!(!push_accepted(r#"{"status":"forbidden"}"#, "probes_saved"));
+        assert!(!push_accepted(r#"{"error":"x"}"#, "probes_saved"));
+        assert!(!push_accepted("<html>", "probes_saved"));
+        assert!(!push_accepted("", "probes_saved"));
+    }
+
+    /// Builds a beacon from the probe packet builder: swaps the frame type, BSSID and fixed fields
+    fn build_beacon(bssid: [u8; 6], ies: &[u8], rssi: Option<i8>) -> Vec<u8> {
+        let mut pkt = build_test_packet(0x00, rssi, [0; 6], 0, &[], None);
+        let h = pkt.len() - 24;
+        pkt[h] = 0x80;
+        pkt[h + 16..h + 22].copy_from_slice(&bssid);
+        pkt.extend_from_slice(&[0; 12]); // timestamp + interval + capability
+        pkt.extend_from_slice(ies);
+        pkt
+    }
+
+    #[test]
+    fn test_beacon_parsed_and_ds_channel_checked() {
+        let bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let ies = [0x00, 0x02, b'A', b'P', 0x03, 0x01, 6];
+        let pkt = build_beacon(bssid, &ies, Some(-61));
+        let rtap = parse_radiotap(&pkt).unwrap();
+        assert_eq!(
+            parse_beacon_frame(&pkt, &rtap),
+            Some((bssid, "AP".to_string(), 6, -61))
+        );
+        // Not a probe
+        assert!(parse_probe_frame(&pkt, &rtap, 0).is_none());
+
+        // DS channel 7 while received on 6 -> leakage, dropped
+        let pkt = build_beacon(bssid, &[0x00, 0x00, 0x03, 0x01, 7], Some(-61));
+        assert!(parse_beacon_frame(&pkt, &parse_radiotap(&pkt).unwrap()).is_none());
+
+        // Hidden SSID without DS element is accepted; missing RSSI is dropped
+        let pkt = build_beacon(bssid, &[0x00, 0x00], Some(-70));
+        let b = parse_beacon_frame(&pkt, &parse_radiotap(&pkt).unwrap()).unwrap();
+        assert_eq!(b.1, "<Hidden>");
+        let pkt = build_beacon(bssid, &[0x00, 0x00], None);
+        assert!(parse_beacon_frame(&pkt, &parse_radiotap(&pkt).unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_ingest_beacon_aggregates_and_is_bounded() {
+        let mut map = HashMap::new();
+        let a = [1u8; 6];
+        for r in [-60, -70, -65] {
+            assert!(ingest_beacon(&mut map, a, "x".into(), 6, r));
+        }
+        let s = &map[&a];
+        assert_eq!((s.rssi_sum, s.n, s.min, s.max), (-195, 3, -70, -60));
+
+        for i in 0..MAX_BEACON_BSSIDS {
+            ingest_beacon(&mut map, [2, i as u8, 0, 0, 0, 0], "y".into(), 1, -50);
+        }
+        assert_eq!(map.len(), MAX_BEACON_BSSIDS);
+        assert!(!ingest_beacon(&mut map, [9u8; 6], "z".into(), 1, -50));
+        assert!(ingest_beacon(&mut map, a, "x".into(), 6, -60));
+    }
+
+    #[test]
+    fn test_push_accepted_status_mismatch() {
+        assert!(push_accepted(r#"{"status":"beacons_saved"}"#, "beacons_saved"));
+        assert!(!push_accepted(r#"{"status":"probes_saved"}"#, "beacons_saved"));
+        assert!(!push_accepted(r#"{"status":"beacons_saved"}"#, "probes_saved"));
     }
 }
