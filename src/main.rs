@@ -1,7 +1,8 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ const MAX_ACTIVE_RECORDS: usize = 1024;
 const MAX_QUEUED_BATCHES: usize = 15;
 const MAX_ITEMS_PER_POST: usize = 250;
 const MAX_BEACON_BSSIDS: usize = 64;
+const MAX_LAN_HOSTS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AggregationKey {
@@ -100,9 +102,15 @@ struct BeaconBatch {
     items: Vec<BeaconItem>,
 }
 
+struct LanBatch {
+    time: String,
+    items: Vec<(String, String)>, // (mac, ip)
+}
+
 enum Batch {
     Probes(Vec<EnrichedProbe>),
     Beacons(BeaconBatch),
+    Lan(LanBatch),
 }
 
 #[derive(Serialize)]
@@ -119,6 +127,126 @@ fn push_accepted(body: &str, expected_status: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .map(|v| v["status"] == expected_status)
         .unwrap_or(false)
+}
+
+/// Subnet being scanned: interface, network address, prefix length, own address
+#[derive(Clone)]
+struct LanNet {
+    dev: String,
+    net: u32,
+    prefix: u8,
+    own: u32,
+}
+
+fn prefix_mask(prefix: u8) -> u32 {
+    u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0)
+}
+
+/// Host addresses of the subnet: no network, broadcast or `own` address
+fn hosts(net: u32, prefix: u8, own: u32) -> impl Iterator<Item = Ipv4Addr> {
+    let base = net & prefix_mask(prefix);
+    let size = 1u32 << (32 - prefix as u32);
+    (1..size - 1).map(move |i| base + i).filter(move |&a| a != own).map(Ipv4Addr::from)
+}
+
+/// Resolved ARP entries (mac, ip) of `dev` inside net/mask from /proc/net/arp text
+fn parse_arp(text: &str, dev: &str, net: u32, mask: u32) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let c: Vec<&str> = line.split_whitespace().collect();
+        if c.len() < 6 || c[5] != dev {
+            continue;
+        }
+        let flags = u32::from_str_radix(c[2].trim_start_matches("0x"), 16).unwrap_or(0);
+        let mac = c[3].to_ascii_lowercase();
+        if flags & 0x2 == 0 || mac == "00:00:00:00:00:00" {
+            continue;
+        }
+        let Ok(ip) = c[0].parse::<Ipv4Addr>() else { continue };
+        if u32::from(ip) & mask != net & mask || !seen.insert(mac.clone()) {
+            continue;
+        }
+        out.push((mac, ip.to_string()));
+        if out.len() >= MAX_LAN_HOSTS {
+            break;
+        }
+    }
+    out
+}
+
+/// Up, non-loopback IPv4 interfaces except `skip`: (name, addr, netmask)
+fn ipv4_ifaces(skip: &str) -> Vec<(String, u32, u32)> {
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills ifap with a list we only read and then free
+    unsafe {
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return out;
+        }
+        let mut p = ifap;
+        while !p.is_null() {
+            let a = &*p;
+            p = a.ifa_next;
+            let up = a.ifa_flags & libc::IFF_UP as u32 != 0 && a.ifa_flags & libc::IFF_LOOPBACK as u32 == 0;
+            if !up || a.ifa_addr.is_null() || a.ifa_netmask.is_null() || (*a.ifa_addr).sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(a.ifa_name).to_string_lossy().into_owned();
+            if name == skip {
+                continue;
+            }
+            let ip = u32::from_be((*(a.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr);
+            let mask = u32::from_be((*(a.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr);
+            out.push((name, ip, mask));
+        }
+        libc::freeifaddrs(ifap);
+    }
+    out
+}
+
+/// LAN to scan: from LAN_CIDR (interface owning an address in it) or the first usable non-sniffer interface
+fn detect_lan(sniffer: &str, cidr: Option<&str>) -> Result<LanNet, String> {
+    let forced = match cidr {
+        Some(c) => {
+            let (ip, p) = c.split_once('/').ok_or("LAN_CIDR needs a.b.c.d/n")?;
+            let ip: Ipv4Addr = ip.trim().parse().map_err(|_| "LAN_CIDR bad address")?;
+            let p: u8 = p.trim().parse().map_err(|_| "LAN_CIDR bad prefix")?;
+            if !(22..=30).contains(&p) {
+                return Err(format!("prefix /{} outside /22../30", p));
+            }
+            Some((u32::from(ip), p))
+        }
+        None => None,
+    };
+    for (dev, own, mask) in ipv4_ifaces(sniffer) {
+        let prefix = mask.count_ones() as u8;
+        if let Some((fnet, fp)) = forced {
+            if own & prefix_mask(fp) != fnet & prefix_mask(fp) {
+                continue;
+            }
+            return Ok(LanNet { dev, net: fnet & prefix_mask(fp), prefix: fp, own });
+        }
+        // skip VPN /32 (tailscale0), docker /16 and the like; take the first home-sized subnet
+        if !(22..=30).contains(&prefix) {
+            continue;
+        }
+        return Ok(LanNet { dev, net: own & mask, prefix, own });
+    }
+    Err("no interface with a /22../30 IPv4 subnet".to_string())
+}
+
+/// ARPs every host of the subnet via UDP discard, then reads the kernel neighbour table
+fn scan_lan(lan: &LanNet) -> Vec<(String, String)> {
+    let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return Vec::new() };
+    let _ = sock.set_nonblocking(true);
+    for ip in hosts(lan.net, lan.prefix, lan.own) {
+        let _ = sock.send_to(&[0u8], (ip, 9)); // EAGAIN/EHOSTUNREACH are normal
+        thread::sleep(Duration::from_millis(2));
+    }
+    thread::sleep(Duration::from_secs(3));
+    let text = fs::read_to_string("/proc/net/arp").unwrap_or_default();
+    parse_arp(&text, &lan.dev, lan.net, prefix_mask(lan.prefix))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1039,7 +1167,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.0 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.1 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1064,7 +1192,7 @@ fn main() {
     let dwell_ms: u64 = env::var("DWELL_MS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(250)
+        .unwrap_or(1000) // A/B 2026-10-26: 1000 ms caught 2.7x the beacons of 250 ms (each hop costs ~350 ms deaf)
         .clamp(100, 5000);
     println!("[*] Hopper Channels: 1, 6, 11 ({}ms dwell)", dwell_ms);
     println!(
@@ -1072,6 +1200,46 @@ fn main() {
         MAX_ACTIVE_RECORDS, MAX_QUEUED_BATCHES
     );
     println!("[*] Debug Logging:   {}", debug_probes);
+
+    let lan_min: u64 = match env::var("LAN_SCAN_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60) {
+        0 => 0,
+        m => m.clamp(10, 1440),
+    };
+    let lan_cidr = env::var("LAN_CIDR").ok().filter(|v| !v.trim().is_empty());
+    let lan = if lan_min == 0 {
+        println!("[*] LAN scan:        disabled");
+        None
+    } else {
+        match detect_lan(&iface, lan_cidr.as_deref()) {
+            Ok(l) => {
+                println!(
+                    "[*] LAN scan:        {}/{} on {} every {} min",
+                    Ipv4Addr::from(l.net),
+                    l.prefix,
+                    l.dev,
+                    lan_min
+                );
+                Some(l)
+            }
+            Err(e) => {
+                println!("[*] LAN scan:        disabled ({})", e);
+                None
+            }
+        }
+    };
+    let lan_slot: Arc<Mutex<Option<LanBatch>>> = Arc::new(Mutex::new(None));
+    if let Some(l) = lan {
+        let slot = Arc::clone(&lan_slot);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(120));
+            loop {
+                let items = scan_lan(&l);
+                println!("[*] LAN scan {}/{}: {} devices", Ipv4Addr::from(l.net), l.prefix, items.len());
+                *slot.lock().unwrap() = Some(LanBatch { time: get_epoch_secs().to_string(), items });
+                thread::sleep(Duration::from_secs(lan_min * 60));
+            }
+        });
+    }
 
     let cache: Arc<Mutex<HashMap<AggregationKey, RawProbeRecord>>> =
         Arc::new(Mutex::new(HashMap::with_capacity(256)));
@@ -1122,6 +1290,7 @@ fn main() {
     // 2. Bounded Batch Sender Thread with Retry Queue & Timeouts
     let flush_cache = Arc::clone(&cache);
     let flush_beacons = Arc::clone(&beacon_cache);
+    let flush_lan = Arc::clone(&lan_slot);
     let flush_url = webapp_url.clone();
     let flush_token = secret_token.clone();
     thread::spawn(move || {
@@ -1188,6 +1357,14 @@ fn main() {
                 }));
             }
 
+            if let Some(b) = flush_lan.lock().unwrap().take() {
+                if retry_queue.len() >= MAX_QUEUED_BATCHES {
+                    retry_queue.pop_front();
+                    dropped_batches += 1;
+                }
+                retry_queue.push_back(Batch::Lan(b));
+            }
+
             if retry_queue.is_empty() || flush_url.is_empty() {
                 continue;
             }
@@ -1199,6 +1376,7 @@ fn main() {
                     match &items_to_send {
                         Batch::Probes(v) => v.len(),
                         Batch::Beacons(b) => b.items.len(),
+                        Batch::Lan(b) => b.items.len(),
                     },
                     retry_queue.len(),
                     dropped_batches
@@ -1222,6 +1400,15 @@ fn main() {
                         req.send_json(&BatchPayload {
                             token: flush_token.clone(),
                             msg_type: "beacons",
+                            time: Some(&b.time),
+                            items: &b.items,
+                        }),
+                    ),
+                    Batch::Lan(b) => (
+                        "lan_saved",
+                        req.send_json(&BatchPayload {
+                            token: flush_token.clone(),
+                            msg_type: "lan",
                             time: Some(&b.time),
                             items: &b.items,
                         }),
@@ -1283,7 +1470,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.0 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.1 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1573,6 +1760,40 @@ mod tests {
         assert!(push_accepted(r#"{"status":"beacons_saved"}"#, "beacons_saved"));
         assert!(!push_accepted(r#"{"status":"probes_saved"}"#, "beacons_saved"));
         assert!(!push_accepted(r#"{"status":"beacons_saved"}"#, "probes_saved"));
+    }
+
+    #[test]
+    fn test_parse_arp() {
+        let arp = "IP address       HW type     Flags       HW address            Mask     Device\n\
+192.168.1.5      0x1         0x2         AA:BB:CC:DD:EE:01     *        eth0\n\
+192.168.1.6      0x1         0x0         aa:bb:cc:dd:ee:02     *        eth0\n\
+192.168.1.7      0x1         0x2         aa:bb:cc:dd:ee:03     *        wlan1\n\
+192.168.1.8      0x1         0x2         00:00:00:00:00:00     *        eth0\n\
+10.0.0.9         0x1         0x2         aa:bb:cc:dd:ee:04     *        eth0\n\
+192.168.1.10     0x1         0x2         aa:bb:cc:dd:ee:01     *        eth0\n";
+        let net = u32::from(Ipv4Addr::new(192, 168, 1, 0));
+        let got = parse_arp(arp, "eth0", net, prefix_mask(24));
+        assert_eq!(got, vec![("aa:bb:cc:dd:ee:01".to_string(), "192.168.1.5".to_string())]);
+    }
+
+    #[test]
+    fn test_hosts() {
+        assert_eq!(hosts(u32::from(Ipv4Addr::new(10, 0, 0, 4)), 30, 0).count(), 2);
+        let net = u32::from(Ipv4Addr::new(192, 168, 1, 0));
+        let own = net + 7;
+        let v: Vec<_> = hosts(net, 24, own).collect();
+        assert_eq!(v.len(), 253);
+        assert!(!v.contains(&Ipv4Addr::from(own)) && !v.contains(&Ipv4Addr::from(net)));
+        assert!(!v.contains(&Ipv4Addr::new(192, 168, 1, 255)));
+    }
+
+    #[test]
+    fn test_lan_payload() {
+        assert!(push_accepted(r#"{"status":"lan_saved"}"#, "lan_saved"));
+        let items = vec![("aa:bb".to_string(), "192.168.1.5".to_string())];
+        let p = BatchPayload { token: "t".into(), msg_type: "lan", time: Some("1"), items: &items };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains(r#""type":"lan""#) && j.contains(r#""items":[["aa:bb","192.168.1.5"]]"#));
     }
 
     #[test]
