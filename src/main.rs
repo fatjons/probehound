@@ -288,6 +288,46 @@ fn fnv1a_hash(data: &[u8]) -> String {
     format!("{:08x}", (h ^ (h >> 32)) as u32)
 }
 
+/// Radiotap frequency (MHz) to channel number: 2.4 GHz 1..14, 5 GHz 32..177; None otherwise
+fn freq_to_channel(mhz: u16) -> Option<u8> {
+    match mhz {
+        2412..=2472 if mhz % 5 == 2 => Some(((mhz - 2407) / 5) as u8),
+        2484 => Some(14),
+        5160..=5885 if mhz % 5 == 0 => Some(((mhz - 5000) / 5) as u8),
+        _ => None,
+    }
+}
+
+/// Channel number to centre frequency (MHz), inverse of `freq_to_channel`
+fn channel_to_freq(ch: u8) -> Option<u32> {
+    match ch {
+        1..=13 => Some(2407 + 5 * ch as u32),
+        14 => Some(2484),
+        32..=177 => Some(5000 + 5 * ch as u32),
+        _ => None,
+    }
+}
+
+const DEFAULT_CHANNELS: [u8; 3] = [1, 6, 11];
+const MAX_CHANNELS: usize = 32;
+
+/// Comma list of channel numbers: invalid/unknown skipped, deduped in order; falls back to 1,6,11
+fn parse_channels(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for t in s.split(',') {
+        if let Ok(c) = t.trim().parse::<u8>() {
+            if channel_to_freq(c).is_some() && !out.contains(&c) && out.len() < MAX_CHANNELS {
+                out.push(c);
+            }
+        }
+    }
+    if out.is_empty() {
+        eprintln!("[!] CHANNELS has no valid channel, using 1, 6, 11");
+        out = DEFAULT_CHANNELS.to_vec();
+    }
+    out
+}
+
 /// Strictly parses Radiotap header according to specification without guessing bytes
 fn parse_radiotap(buf: &[u8]) -> Option<RadiotapInfo> {
     if buf.len() < 8 || buf[0] != 0 {
@@ -359,15 +399,7 @@ fn parse_radiotap(buf: &[u8]) -> Option<RadiotapInfo> {
             return None;
         }
         let freq = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
-        channel = if (2412..=2472).contains(&freq) {
-            ((freq - 2407) / 5) as u8
-        } else if freq == 2484 {
-            14
-        } else if (5180..=5825).contains(&freq) {
-            ((freq - 5000) / 5) as u8
-        } else {
-            0
-        };
+        channel = freq_to_channel(freq).unwrap_or(0);
         cursor += 4;
     }
 
@@ -942,7 +974,7 @@ mod nl80211 {
     }
 
     fn build_set_channel(family: u16, seq: u32, ifindex: u32, ch: u8) -> Vec<u8> {
-        let freq = 2407 + 5 * ch as u32;
+        let freq = super::channel_to_freq(ch).unwrap_or(0);
         build_msg(
             family,
             NLM_F_REQUEST | NLM_F_ACK,
@@ -1088,7 +1120,7 @@ mod nl80211 {
         }
 
         pub fn set_channel(&mut self, ch: u8) -> io::Result<()> {
-            if !(1..=13).contains(&ch) {
+            if super::channel_to_freq(ch).is_none() {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
             let seq = self.next_seq();
@@ -1126,6 +1158,12 @@ mod nl80211 {
                 e.extend(ne32(v));
             }
             assert_eq!(build_set_channel(0x1c, 7, 3, 6), e);
+        }
+
+        #[test]
+        fn test_set_channel_bytes_5ghz() {
+            let m = build_set_channel(0x1c, 7, 3, 36);
+            assert!(m.windows(4).any(|w| w == ne32(5180)));
         }
 
         #[test]
@@ -1173,7 +1211,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.2 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.3 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1200,7 +1238,12 @@ fn main() {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(1000) // A/B 2026-10-26: 1000 ms caught 2.7x the beacons of 250 ms (each hop costs ~350 ms deaf)
         .clamp(100, 5000);
-    println!("[*] Hopper Channels: 1, 6, 11 ({}ms dwell)", dwell_ms);
+    let channels = parse_channels(&env::var("CHANNELS").unwrap_or_else(|_| "1,6,11".to_string()));
+    println!(
+        "[*] Hopper Channels: {} ({}ms dwell)",
+        channels.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", "),
+        dwell_ms
+    );
     println!(
         "[*] Bounds:          {} max records / {} retry batches",
         MAX_ACTIVE_RECORDS, MAX_QUEUED_BATCHES
@@ -1255,14 +1298,25 @@ fn main() {
     // 1. Channel Hopper Thread (nl80211 with `iw` fallback; channel updated only on success)
     let hopper_iface = iface.clone();
     thread::spawn(move || {
-        let channels: [u8; 3] = [1, 6, 11];
+        let mut channels = channels;
+        let mut fails = vec![0u8; channels.len()]; // consecutive failed hops per channel
+        let mut fell_back = false;
+        // A failure only counts against a channel when the hop before it worked: then the adapter is fine
+        // and this channel is the problem. A USB hiccup fails every channel and must not strip valid ones.
+        let mut prev_ok = false;
+        let mut settled = false; // single channel already set
         let mut nl = nl80211::Hopper::open(&hopper_iface)
             .map_err(|e| eprintln!("[!] nl80211 unavailable ({}), using iw", e))
             .ok();
         let mut last_err: Option<Instant> = None;
         let mut idx = 0;
         loop {
-            let ch = channels[idx % channels.len()];
+            if settled {
+                thread::sleep(Duration::from_millis(dwell_ms));
+                continue;
+            }
+            let pos = idx % channels.len();
+            let ch = channels[pos];
             idx += 1;
             let mut ok = false;
             if let Some(h) = nl.as_mut() {
@@ -1284,9 +1338,29 @@ fn main() {
                     Ok(status) if status.success()
                 );
             }
+            let counts = prev_ok || channels.len() == 1;
+            prev_ok = ok;
             if ok {
+                fails[pos] = 0;
                 CURRENT_CHANNEL.store(ch, Ordering::Relaxed);
+                settled = channels.len() == 1;
             } else {
+                if counts {
+                    fails[pos] += 1;
+                }
+                if fails[pos] >= 3 && !fell_back {
+                    eprintln!("[!] channel {} not supported by {}, removed from rotation", ch, hopper_iface);
+                    channels.remove(pos);
+                    fails.remove(pos);
+                    idx = pos;
+                    if channels.is_empty() {
+                        eprintln!("[!] no usable channel left, falling back to 1, 6, 11");
+                        channels = DEFAULT_CHANNELS.to_vec();
+                        fails = vec![0; channels.len()];
+                        fell_back = true;
+                        idx = 0;
+                    }
+                }
                 thread::sleep(Duration::from_secs(1));
             }
             thread::sleep(Duration::from_millis(dwell_ms));
@@ -1481,7 +1555,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.2 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.3 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1745,6 +1819,38 @@ mod tests {
         assert_eq!(b.1, "<Hidden>");
         let pkt = build_beacon(bssid, &[0x00, 0x00], None);
         assert!(parse_beacon_frame(&pkt, &parse_radiotap(&pkt).unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_beacon_5ghz_without_ds_tag() {
+        let bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut pkt = build_beacon(bssid, &[0x00, 0x02, b'A', b'P'], Some(-55));
+        pkt[10..12].copy_from_slice(&5180u16.to_le_bytes());
+        let rtap = parse_radiotap(&pkt).unwrap();
+        assert_eq!(rtap.channel, 36);
+        assert_eq!(parse_beacon_frame(&pkt, &rtap), Some((bssid, "AP".to_string(), 36, -55)));
+    }
+
+    #[test]
+    fn test_channel_freq_mapping() {
+        for (ch, f) in [(1u8, 2412u16), (6, 2437), (13, 2472), (14, 2484), (36, 5180), (165, 5825), (177, 5885)] {
+            assert_eq!(freq_to_channel(f), Some(ch));
+            assert_eq!(channel_to_freq(ch), Some(f as u32));
+        }
+        for f in [0u16, 2411, 2417 + 1, 4900, 5955, 6000] {
+            assert_eq!(freq_to_channel(f), None);
+        }
+        for c in [0u8, 15, 31, 178, 255] {
+            assert_eq!(channel_to_freq(c), None);
+        }
+    }
+
+    #[test]
+    fn test_parse_channels() {
+        assert_eq!(parse_channels("1, 6,11,36,abc,6,200"), vec![1, 6, 11, 36]);
+        assert_eq!(parse_channels(""), vec![1, 6, 11]);
+        assert_eq!(parse_channels("0,15,x"), vec![1, 6, 11]);
+        assert_eq!(parse_channels("36"), vec![36]);
     }
 
     #[test]
