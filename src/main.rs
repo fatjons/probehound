@@ -19,6 +19,8 @@ static HOP_FAIL: AtomicU32 = AtomicU32::new(0);
 static FRAMES: AtomicU32 = AtomicU32::new(0); // frames with a valid radiotap header
 static PROBES: AtomicU32 = AtomicU32::new(0);
 static BEACONS: AtomicU32 = AtomicU32::new(0);
+static STATIONS_SEEN: AtomicU32 = AtomicU32::new(0); // data frames counted into station stats
+static STATIONS_OVERFLOW: AtomicU32 = AtomicU32::new(0); // new stations skipped at the cap
 static BAD_FCS: AtomicU32 = AtomicU32::new(0);
 static DROPPED_FRAMES: AtomicU32 = AtomicU32::new(0); // radiotap header unparseable
 static NL_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -29,6 +31,7 @@ const MAX_ACTIVE_RECORDS: usize = 1024;
 const MAX_QUEUED_BATCHES: usize = 15;
 const MAX_ITEMS_PER_POST: usize = 250;
 const MAX_BEACON_BSSIDS: usize = 64;
+const MAX_STATIONS: usize = 128;
 const MAX_LAN_HOSTS: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -100,13 +103,36 @@ type BeaconItem = (String, String, u8, f32, i8, i8, u32, Option<f32>);
 
 /// Population std dev of beacon RSSI, 1 decimal; None for a single sample
 fn beacon_std(b: &BeaconStat) -> Option<f32> {
-    if b.n < 2 {
+    rssi_std(b.n, b.rssi_sum, b.rssi_sq_sum)
+}
+
+fn rssi_std(n: u32, sum: i32, sq_sum: i64) -> Option<f32> {
+    if n < 2 {
         return None;
     }
-    let n = b.n as f64;
-    let mean = b.rssi_sum as f64 / n;
-    let sd = (b.rssi_sq_sum as f64 / n - mean * mean).max(0.0).sqrt();
+    let n = n as f64;
+    let mean = sum as f64 / n;
+    let sd = (sq_sum as f64 / n - mean * mean).max(0.0).sqrt();
     Some(((sd * 10.0).round() / 10.0) as f32)
+}
+
+/// Per-minute RSSI of one client station, from the headers of its data frames
+struct StationStat {
+    bssid: [u8; 6], // last seen
+    channel: u8,
+    rssi_sum: i32,
+    rssi_sq_sum: i64,
+    n: u32,
+    min: i8,
+    max: i8,
+}
+
+/// [sta, bssid, channel, mean, min, max, n, std] serialized as a JSON array
+type StationItem = (String, String, u8, f32, i8, i8, u32, Option<f32>);
+
+struct StationBatch {
+    time: String,
+    items: Vec<StationItem>,
 }
 
 struct BeaconBatch {
@@ -132,6 +158,8 @@ struct StatusReport {
     frames: u32,
     probes: u32,
     beacons: u32,
+    stations: u32,
+    stations_overflow: u32,
     bad_fcs: u32,
     dropped_frames: u32,
     queued: usize,
@@ -151,6 +179,7 @@ struct StatusBatch {
 enum Batch {
     Probes(Vec<EnrichedProbe>),
     Beacons(BeaconBatch),
+    Stations(StationBatch),
     Lan(LanBatch),
     Status(StatusBatch),
 }
@@ -197,6 +226,8 @@ fn collect_status(started: Instant, iface: &str, dwell_ms: u64, queued: usize, d
         frames: take(&FRAMES),
         probes: take(&PROBES),
         beacons: take(&BEACONS),
+        stations: take(&STATIONS_SEEN),
+        stations_overflow: take(&STATIONS_OVERFLOW),
         bad_fcs: take(&BAD_FCS),
         dropped_frames: take(&DROPPED_FRAMES),
         queued,
@@ -975,6 +1006,63 @@ fn ingest_beacon(
     }
 }
 
+/// Parses a ToDS data frame (station -> AP) into (station, bssid, channel, rssi) from the 802.11 header only
+fn parse_station_frame(buf: &[u8], rtap: &RadiotapInfo) -> Option<([u8; 6], [u8; 6], u8, i8)> {
+    let frame = extract_frame(buf, rtap)?;
+    // Type 2 Data (incl. null/QoS-null); ToDS=1, FromDS=0 only
+    if (frame[0] >> 2) & 3 != 2 || frame[1] & 3 != 1 {
+        return None;
+    }
+    let rssi = rtap.rssi?;
+    let mut bssid = [0u8; 6];
+    bssid.copy_from_slice(&frame[4..10]);
+    let mut sta = [0u8; 6];
+    sta.copy_from_slice(&frame[10..16]);
+    if sta[0] & 1 == 1 {
+        return None;
+    }
+    Some((sta, bssid, rtap.channel, rssi))
+}
+
+/// Aggregates a station observation into the bounded per-station map; false if skipped at the cap
+fn ingest_station(
+    map: &mut HashMap<[u8; 6], StationStat>,
+    sta: [u8; 6],
+    bssid: [u8; 6],
+    channel: u8,
+    rssi: i8,
+) -> bool {
+    let is_full = map.len() >= MAX_STATIONS;
+    match map.entry(sta) {
+        Entry::Occupied(mut occ) => {
+            let e = occ.get_mut();
+            e.bssid = bssid;
+            e.rssi_sum += rssi as i32;
+            e.rssi_sq_sum += (rssi as i64) * (rssi as i64);
+            e.n += 1;
+            e.min = e.min.min(rssi);
+            e.max = e.max.max(rssi);
+            true
+        }
+        Entry::Vacant(vac) => {
+            if is_full {
+                false
+            } else {
+                vac.insert(StationStat {
+                    bssid,
+                    channel,
+                    rssi_sum: rssi as i32,
+                    rssi_sq_sum: (rssi as i64) * (rssi as i64),
+                    n: 1,
+                    min: rssi,
+                    max: rssi,
+                });
+                true
+            }
+        }
+    }
+}
+
 fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
     let avg_rssi = if raw.rssi_count > 0 {
         Some((raw.rssi_sum as f32 / raw.rssi_count as f32).round() as i8)
@@ -1313,7 +1401,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.4 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.5 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1351,6 +1439,12 @@ fn main() {
         MAX_ACTIVE_RECORDS, MAX_QUEUED_BATCHES
     );
     println!("[*] Debug Logging:   {}", debug_probes);
+    let stations_on = env::var("STATIONS").map(|v| v.trim() != "0").unwrap_or(true);
+    if stations_on {
+        println!("[*] Stations:        data-frame RSSI (max {}/min)", MAX_STATIONS);
+    } else {
+        println!("[*] Stations:        disabled");
+    }
     let status_min: u64 = match env::var("STATUS_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5) {
         0 => 0,
         m => m.clamp(1, 60),
@@ -1405,6 +1499,8 @@ fn main() {
     let cache: Arc<Mutex<HashMap<AggregationKey, RawProbeRecord>>> =
         Arc::new(Mutex::new(HashMap::with_capacity(256)));
     let beacon_cache: Arc<Mutex<HashMap<[u8; 6], BeaconStat>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let station_cache: Arc<Mutex<HashMap<[u8; 6], StationStat>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     // 1. Channel Hopper Thread (nl80211 with `iw` fallback; channel updated only on success)
@@ -1490,6 +1586,7 @@ fn main() {
     // 2. Bounded Batch Sender Thread with Retry Queue & Timeouts
     let flush_cache = Arc::clone(&cache);
     let flush_beacons = Arc::clone(&beacon_cache);
+    let flush_stations = Arc::clone(&station_cache);
     let flush_lan = Arc::clone(&lan_slot);
     let flush_url = webapp_url.clone();
     let flush_token = secret_token.clone();
@@ -1560,6 +1657,26 @@ fn main() {
                 }));
             }
 
+            let drained_stations = std::mem::take(&mut *flush_stations.lock().unwrap());
+            if !drained_stations.is_empty() {
+                let items = drained_stations
+                    .into_iter()
+                    .map(|(sta, s)| {
+                        let mean = (s.rssi_sum as f32 / s.n as f32 * 10.0).round() / 10.0;
+                        let std = rssi_std(s.n, s.rssi_sum, s.rssi_sq_sum);
+                        (format_mac(&sta), format_mac(&s.bssid), s.channel, mean, s.min, s.max, s.n, std)
+                    })
+                    .collect();
+                if retry_queue.len() >= MAX_QUEUED_BATCHES {
+                    retry_queue.pop_front();
+                    dropped_batches += 1;
+                }
+                retry_queue.push_back(Batch::Stations(StationBatch {
+                    time: get_epoch_secs().to_string(),
+                    items,
+                }));
+            }
+
             if let Some(b) = flush_lan.lock().unwrap().take() {
                 if retry_queue.len() >= MAX_QUEUED_BATCHES {
                     retry_queue.pop_front();
@@ -1589,6 +1706,7 @@ fn main() {
                     match &items_to_send {
                         Batch::Probes(v) => v.len(),
                         Batch::Beacons(b) => b.items.len(),
+                        Batch::Stations(b) => b.items.len(),
                         Batch::Lan(b) => b.items.len(),
                         Batch::Status(_) => 1,
                     },
@@ -1614,6 +1732,15 @@ fn main() {
                         req.send_json(&BatchPayload {
                             token: flush_token.clone(),
                             msg_type: "beacons",
+                            time: Some(&b.time),
+                            items: &b.items,
+                        }),
+                    ),
+                    Batch::Stations(b) => (
+                        "stations_saved",
+                        req.send_json(&BatchPayload {
+                            token: flush_token.clone(),
+                            msg_type: "stations",
                             time: Some(&b.time),
                             items: &b.items,
                         }),
@@ -1698,7 +1825,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.4 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.5 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1763,6 +1890,15 @@ fn main() {
                     }
                     let mut lock = beacon_cache.lock().unwrap();
                     let _ = ingest_beacon(&mut lock, bssid, ssid, channel, rssi);
+                } else if stations_on {
+                    if let Some((sta, bssid, channel, rssi)) = parse_station_frame(&buf[..len], &rtap) {
+                        let mut lock = station_cache.lock().unwrap();
+                        if ingest_station(&mut lock, sta, bssid, channel, rssi) {
+                            STATIONS_SEEN.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            STATIONS_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             } else {
                 DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -2087,7 +2223,7 @@ mod tests {
         assert!(j.contains(r#""type":"status""#));
         for f in [
             "version", "uptime_s", "iface", "channels", "dwell_ms", "nl80211", "hop_ok", "hop_fail", "frames",
-            "probes", "beacons", "bad_fcs", "dropped_frames", "queued", "dropped_total", "lan_devices", "load1",
+            "probes", "beacons", "stations", "stations_overflow", "bad_fcs", "dropped_frames", "queued", "dropped_total", "lan_devices", "load1",
             "rss_kb", "throttled", "temp_c",
         ] {
             assert!(j.contains(&format!("\"{}\":", f)), "missing {}", f);
@@ -2111,5 +2247,52 @@ mod tests {
         let item = |std| ("aa".to_string(), "s".to_string(), 6u8, -60.0f32, -62i8, -58i8, 4u32, std);
         assert!(serde_json::to_string(&item(sd)).unwrap().ends_with(",1.4]"));
         assert!(serde_json::to_string(&item(single)).unwrap().ends_with(",null]"));
+    }
+
+    /// Builds a data frame from the probe packet builder: FC, flags, addr1 (bssid) and addr2 (sta)
+    fn build_data(fc0: u8, flags: u8, bssid: [u8; 6], sta: [u8; 6], rssi: Option<i8>) -> Vec<u8> {
+        let mut pkt = build_test_packet(0x00, rssi, [0; 6], 0, &[], None);
+        let h = pkt.len() - 24;
+        pkt[h] = fc0;
+        pkt[h + 1] = flags;
+        pkt[h + 4..h + 10].copy_from_slice(&bssid);
+        pkt[h + 10..h + 16].copy_from_slice(&sta);
+        pkt
+    }
+
+    #[test]
+    fn test_parse_station_frame() {
+        let (bssid, sta) = ([2u8, 1, 1, 1, 1, 1], [2u8, 2, 2, 2, 2, 2]);
+        let parse = |p: &Vec<u8>| parse_station_frame(p, &parse_radiotap(p).unwrap());
+        // QoS data (0x88) and null data (0x48), ToDS
+        assert_eq!(parse(&build_data(0x88, 0x01, bssid, sta, Some(-47))), Some((sta, bssid, 6, -47)));
+        assert!(parse(&build_data(0x48, 0x01, bssid, sta, Some(-47))).is_some());
+        assert!(parse(&build_data(0x88, 0x02, bssid, sta, Some(-47))).is_none()); // FromDS
+        assert!(parse(&build_data(0x88, 0x03, bssid, sta, Some(-47))).is_none()); // WDS
+        assert!(parse(&build_data(0x88, 0x00, bssid, sta, Some(-47))).is_none()); // IBSS
+        assert!(parse(&build_data(0x40, 0x01, bssid, sta, Some(-47))).is_none()); // mgmt
+        assert!(parse(&build_data(0x88, 0x01, bssid, [0x03, 2, 2, 2, 2, 2], Some(-47))).is_none()); // multicast sta
+        assert!(parse(&build_data(0x88, 0x01, bssid, sta, None)).is_none());
+        let short = build_data(0x88, 0x01, bssid, sta, Some(-47));
+        assert!(parse_station_frame(&short[..short.len() - 1], &parse_radiotap(&short[..short.len() - 1]).unwrap()).is_none());
+    }
+
+    #[test]
+    fn test_station_cap_and_json() {
+        let mut map = HashMap::new();
+        for i in 0..MAX_STATIONS {
+            assert!(ingest_station(&mut map, [2, i as u8, 0, 0, 0, 0], [2; 6], 6, -50));
+        }
+        assert!(!ingest_station(&mut map, [4u8; 6], [2; 6], 6, -50)); // 129th distinct
+        assert!(ingest_station(&mut map, [2, 0, 0, 0, 0, 0], [3; 6], 6, -60));
+        let s = &map[&[2, 0, 0, 0, 0, 0]];
+        assert_eq!((s.n, s.min, s.max, s.bssid), (2, -60, -50, [3; 6]));
+        let sd = rssi_std(s.n, s.rssi_sum, s.rssi_sq_sum);
+        assert_eq!(sd, Some(5.0));
+        let item = |std| ("a".to_string(), "b".to_string(), 6u8, -55.0f32, -60i8, -50i8, 2u32, std);
+        let p = BatchPayload { token: "t".into(), msg_type: "stations", time: Some("1"), items: &[item(sd)] };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains(r#""type":"stations""#) && j.contains(",5.0]]"));
+        assert!(serde_json::to_string(&item(None)).unwrap().ends_with(",null]"));
     }
 }
