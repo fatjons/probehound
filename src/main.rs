@@ -4,7 +4,7 @@ use std::env;
 use std::fs;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 static CURRENT_CHANNEL: AtomicU8 = AtomicU8::new(1);
+
+// Status counters, swapped to 0 each time a status batch is built (Relaxed: they are statistics only)
+static HOP_OK: AtomicU32 = AtomicU32::new(0);
+static HOP_FAIL: AtomicU32 = AtomicU32::new(0);
+static FRAMES: AtomicU32 = AtomicU32::new(0); // frames with a valid radiotap header
+static PROBES: AtomicU32 = AtomicU32::new(0);
+static BEACONS: AtomicU32 = AtomicU32::new(0);
+static BAD_FCS: AtomicU32 = AtomicU32::new(0);
+static DROPPED_FRAMES: AtomicU32 = AtomicU32::new(0); // radiotap header unparseable
+static NL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LAN_DEVICES: AtomicU32 = AtomicU32::new(u32::MAX); // u32::MAX = no scan yet
+static ROTATION: Mutex<Vec<u8>> = Mutex::new(Vec::new()); // hopper's current channel list
 
 const MAX_ACTIVE_RECORDS: usize = 1024;
 const MAX_QUEUED_BATCHES: usize = 15;
@@ -107,10 +119,100 @@ struct LanBatch {
     items: Vec<(String, String)>, // (mac, ip)
 }
 
+#[derive(Serialize)]
+struct StatusReport {
+    version: &'static str,
+    uptime_s: u64,
+    iface: String,
+    channels: Vec<u8>,
+    dwell_ms: u64,
+    nl80211: bool,
+    hop_ok: u32,
+    hop_fail: u32,
+    frames: u32,
+    probes: u32,
+    beacons: u32,
+    bad_fcs: u32,
+    dropped_frames: u32,
+    queued: usize,
+    dropped_total: u64,
+    lan_devices: Option<u32>,
+    load1: Option<f32>,
+    rss_kb: Option<u64>,
+    throttled: Option<u32>,
+    temp_c: Option<f32>,
+}
+
+struct StatusBatch {
+    time: String,
+    item: StatusReport,
+}
+
 enum Batch {
     Probes(Vec<EnrichedProbe>),
     Beacons(BeaconBatch),
     Lan(LanBatch),
+    Status(StatusBatch),
+}
+
+/// First field of /proc/loadavg
+fn parse_loadavg(s: &str) -> Option<f32> {
+    s.split_whitespace().next()?.parse().ok()
+}
+
+/// VmRSS (kB) from /proc/self/status text
+fn parse_vmrss(s: &str) -> Option<u64> {
+    s.lines().find_map(|l| l.strip_prefix("VmRSS:"))?.split_whitespace().next()?.parse().ok()
+}
+
+/// First /sys/class/hwmon/hwmonN/<file> whose `name` is `want` (e.g. rpi_volt, cpu_thermal)
+fn hwmon_read(want: &str, file: &str) -> Option<String> {
+    for e in fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        if fs::read_to_string(e.path().join("name")).ok()?.trim() == want {
+            return fs::read_to_string(e.path().join(file)).ok();
+        }
+    }
+    None
+}
+
+/// "0x50005" or "throttled=0x0"
+fn parse_throttled(s: &str) -> Option<u32> {
+    let v = s.trim().rsplit('=').next()?;
+    u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()
+}
+
+/// Builds a status report, resetting the since-last-status counters
+fn collect_status(started: Instant, iface: &str, dwell_ms: u64, queued: usize, dropped_total: u64) -> StatusReport {
+    let take = |a: &AtomicU32| a.swap(0, Ordering::Relaxed);
+    let lan = LAN_DEVICES.load(Ordering::Relaxed);
+    StatusReport {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_s: started.elapsed().as_secs(),
+        iface: iface.to_string(),
+        channels: ROTATION.lock().unwrap().clone(),
+        dwell_ms,
+        nl80211: NL_ACTIVE.load(Ordering::Relaxed),
+        hop_ok: take(&HOP_OK),
+        hop_fail: take(&HOP_FAIL),
+        frames: take(&FRAMES),
+        probes: take(&PROBES),
+        beacons: take(&BEACONS),
+        bad_fcs: take(&BAD_FCS),
+        dropped_frames: take(&DROPPED_FRAMES),
+        queued,
+        dropped_total,
+        lan_devices: (lan != u32::MAX).then_some(lan),
+        load1: fs::read_to_string("/proc/loadavg").ok().and_then(|s| parse_loadavg(&s)),
+        rss_kb: fs::read_to_string("/proc/self/status").ok().and_then(|s| parse_vmrss(&s)),
+        // firmware flags if exposed, else the Pi kernel's undervoltage alarm (0/1, current state)
+        throttled: fs::read_to_string("/sys/devices/platform/soc/soc:firmware/get_throttled")
+            .ok()
+            .or_else(|| hwmon_read("rpi_volt", "in0_lcrit_alarm"))
+            .and_then(|s| parse_throttled(&s).or_else(|| s.trim().parse().ok())),
+        temp_c: hwmon_read("cpu_thermal", "temp1_input")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .map(|m| (m / 100.0).round() / 10.0),
+    }
 }
 
 #[derive(Serialize)]
@@ -1211,7 +1313,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.3 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.4 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1249,6 +1351,15 @@ fn main() {
         MAX_ACTIVE_RECORDS, MAX_QUEUED_BATCHES
     );
     println!("[*] Debug Logging:   {}", debug_probes);
+    let status_min: u64 = match env::var("STATUS_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5) {
+        0 => 0,
+        m => m.clamp(1, 60),
+    };
+    if status_min == 0 {
+        println!("[*] Status:          disabled");
+    } else {
+        println!("[*] Status:          every {} min", status_min);
+    }
 
     let lan_min: u64 = match env::var("LAN_SCAN_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(60) {
         0 => 0,
@@ -1284,6 +1395,7 @@ fn main() {
             loop {
                 let items = scan_lan(&l);
                 println!("[*] LAN scan {}/{}: {} devices", Ipv4Addr::from(l.net), l.prefix, items.len());
+                LAN_DEVICES.store(items.len() as u32, Ordering::Relaxed);
                 *slot.lock().unwrap() = Some(LanBatch { time: get_epoch_secs().to_string(), items });
                 thread::sleep(Duration::from_secs(lan_min * 60));
             }
@@ -1310,6 +1422,7 @@ fn main() {
             .ok();
         let mut last_err: Option<Instant> = None;
         let mut idx = 0;
+        *ROTATION.lock().unwrap() = channels.clone();
         loop {
             if settled {
                 thread::sleep(Duration::from_millis(dwell_ms));
@@ -1321,7 +1434,10 @@ fn main() {
             let mut ok = false;
             if let Some(h) = nl.as_mut() {
                 match h.set_channel(ch) {
-                    Ok(()) => ok = true,
+                    Ok(()) => {
+                        ok = true;
+                        NL_ACTIVE.store(true, Ordering::Relaxed);
+                    }
                     Err(e) => {
                         if last_err.map_or(true, |t| t.elapsed() >= Duration::from_secs(600)) {
                             eprintln!("[!] nl80211 set_channel failed ({}), falling back to iw", e);
@@ -1331,6 +1447,7 @@ fn main() {
                 }
             }
             if !ok {
+                NL_ACTIVE.store(false, Ordering::Relaxed);
                 ok = matches!(
                     Command::new("iw")
                         .args(["dev", &hopper_iface, "set", "channel", &ch.to_string()])
@@ -1341,10 +1458,12 @@ fn main() {
             let counts = prev_ok || channels.len() == 1;
             prev_ok = ok;
             if ok {
+                HOP_OK.fetch_add(1, Ordering::Relaxed);
                 fails[pos] = 0;
                 CURRENT_CHANNEL.store(ch, Ordering::Relaxed);
                 settled = channels.len() == 1;
             } else {
+                HOP_FAIL.fetch_add(1, Ordering::Relaxed);
                 if counts {
                     fails[pos] += 1;
                 }
@@ -1360,6 +1479,7 @@ fn main() {
                         fell_back = true;
                         idx = 0;
                     }
+                    *ROTATION.lock().unwrap() = channels.clone();
                 }
                 thread::sleep(Duration::from_secs(1));
             }
@@ -1373,6 +1493,8 @@ fn main() {
     let flush_lan = Arc::clone(&lan_slot);
     let flush_url = webapp_url.clone();
     let flush_token = secret_token.clone();
+    let status_iface = iface.clone();
+    let started = Instant::now();
     thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
@@ -1382,6 +1504,7 @@ fn main() {
 
         let mut retry_queue: VecDeque<Batch> = VecDeque::new();
         let mut dropped_batches: u64 = 0;
+        let mut next_status = Instant::now() + Duration::from_secs(status_min * 60);
 
         loop {
             thread::sleep(Duration::from_secs(60));
@@ -1445,6 +1568,16 @@ fn main() {
                 retry_queue.push_back(Batch::Lan(b));
             }
 
+            if status_min > 0 && Instant::now() >= next_status {
+                next_status = Instant::now() + Duration::from_secs(status_min * 60);
+                let item = collect_status(started, &status_iface, dwell_ms, retry_queue.len(), dropped_batches);
+                if retry_queue.len() >= MAX_QUEUED_BATCHES {
+                    retry_queue.pop_front();
+                    dropped_batches += 1;
+                }
+                retry_queue.push_back(Batch::Status(StatusBatch { time: get_epoch_secs().to_string(), item }));
+            }
+
             if retry_queue.is_empty() || flush_url.is_empty() {
                 continue;
             }
@@ -1457,6 +1590,7 @@ fn main() {
                         Batch::Probes(v) => v.len(),
                         Batch::Beacons(b) => b.items.len(),
                         Batch::Lan(b) => b.items.len(),
+                        Batch::Status(_) => 1,
                     },
                     retry_queue.len(),
                     dropped_batches
@@ -1491,6 +1625,15 @@ fn main() {
                             msg_type: "lan",
                             time: Some(&b.time),
                             items: &b.items,
+                        }),
+                    ),
+                    Batch::Status(b) => (
+                        "status_saved",
+                        req.send_json(&BatchPayload {
+                            token: flush_token.clone(),
+                            msg_type: "status",
+                            time: Some(&b.time),
+                            items: std::slice::from_ref(&b.item),
                         }),
                     ),
                 };
@@ -1555,7 +1698,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.3 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.4 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1582,8 +1725,13 @@ fn main() {
 
             let len = n as usize;
             if let Some(rtap) = parse_radiotap(&buf[..len]) {
+                FRAMES.fetch_add(1, Ordering::Relaxed);
+                if rtap.bad_fcs {
+                    BAD_FCS.fetch_add(1, Ordering::Relaxed);
+                }
                 let now_secs = get_epoch_secs();
                 if let Some((record, key)) = parse_probe_frame(&buf[..len], &rtap, now_secs) {
+                    PROBES.fetch_add(1, Ordering::Relaxed);
                     if debug_probes {
                         println!(
                             "Probe: {} [FP:{}] | Ch:{:2} | {:?} dBm | Type: {:9} | Caps: {:12} | SSID: {:14} | {}",
@@ -1603,6 +1751,7 @@ fn main() {
                 } else if let Some((bssid, ssid, channel, rssi)) =
                     parse_beacon_frame(&buf[..len], &rtap)
                 {
+                    BEACONS.fetch_add(1, Ordering::Relaxed);
                     if debug_probes {
                         println!(
                             "Beacon: {} | Ch:{:2} | {} dBm | SSID: {}",
@@ -1615,6 +1764,8 @@ fn main() {
                     let mut lock = beacon_cache.lock().unwrap();
                     let _ = ingest_beacon(&mut lock, bssid, ssid, channel, rssi);
                 }
+            } else {
+                DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1918,6 +2069,30 @@ mod tests {
         assert!(push_ignored(r#"{"status":"ignored"}"#));
         assert!(!push_ignored(r#"{"status":"forbidden"}"#));
         assert!(!push_ignored("<html>quota</html>"));
+    }
+
+    #[test]
+    fn test_status_helpers_and_payload() {
+        assert_eq!(parse_loadavg("0.42 0.30 0.20 1/80 1234\n"), Some(0.42));
+        assert_eq!(parse_loadavg(""), None);
+        assert_eq!(parse_vmrss("Name:\tx\nVmRSS:\t    1234 kB\nThreads: 3\n"), Some(1234));
+        assert_eq!(parse_vmrss("Name:\tx\n"), None);
+        assert_eq!(parse_throttled("0x50005\n"), Some(0x50005));
+        assert_eq!(parse_throttled("throttled=0x0"), Some(0));
+        assert_eq!(parse_throttled("junk"), None);
+
+        let r = collect_status(Instant::now(), "wlan0", 1000, 2, 3);
+        let p = BatchPayload { token: "t".into(), msg_type: "status", time: Some("1"), items: std::slice::from_ref(&r) };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains(r#""type":"status""#));
+        for f in [
+            "version", "uptime_s", "iface", "channels", "dwell_ms", "nl80211", "hop_ok", "hop_fail", "frames",
+            "probes", "beacons", "bad_fcs", "dropped_frames", "queued", "dropped_total", "lan_devices", "load1",
+            "rss_kb", "throttled", "temp_c",
+        ] {
+            assert!(j.contains(&format!("\"{}\":", f)), "missing {}", f);
+        }
+        assert!(push_accepted(r#"{"status":"status_saved"}"#, "status_saved"));
     }
 
     #[test]
