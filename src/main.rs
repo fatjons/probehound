@@ -123,6 +123,12 @@ struct BatchPayload<'a, T> {
     items: &'a [T],
 }
 
+/// The webhook answers "ignored" for a type it does not know: retrying can never succeed,
+/// and a re-queued batch at the head of the queue would hold back every probe batch behind it.
+fn push_ignored(body: &str) -> bool {
+    push_accepted(body, "ignored")
+}
+
 fn push_accepted(body: &str, expected_status: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .map(|v| v["status"] == expected_status)
@@ -1167,7 +1173,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.1 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.2 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1419,6 +1425,11 @@ fn main() {
                     Ok(resp) => {
                         let status = resp.status();
                         let body = resp.into_string().unwrap_or_default();
+                        if push_ignored(&body) {
+                            eprintln!("[!] Webhook does not know this batch type ({}): dropped", expected);
+                            dropped_batches += 1;
+                            continue;
+                        }
                         if !push_accepted(&body, expected) {
                             eprintln!(
                                 "[!] Webhook Push Rejected (re-queueing batch): {}",
@@ -1470,7 +1481,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.1 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.2 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1794,6 +1805,13 @@ mod tests {
         let p = BatchPayload { token: "t".into(), msg_type: "lan", time: Some("1"), items: &items };
         let j = serde_json::to_string(&p).unwrap();
         assert!(j.contains(r#""type":"lan""#) && j.contains(r#""items":[["aa:bb","192.168.1.5"]]"#));
+    }
+
+    #[test]
+    fn test_push_ignored() {
+        assert!(push_ignored(r#"{"status":"ignored"}"#));
+        assert!(!push_ignored(r#"{"status":"forbidden"}"#));
+        assert!(!push_ignored("<html>quota</html>"));
     }
 
     #[test]
