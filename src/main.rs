@@ -1401,7 +1401,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.5 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.6 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1426,7 +1426,7 @@ fn main() {
     let dwell_ms: u64 = env::var("DWELL_MS")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1000) // A/B 2026-10-26: 1000 ms caught 2.7x the beacons of 250 ms (each hop costs ~350 ms deaf)
+        .unwrap_or(3000) // A/B 2026-10-26: 1000 ms = 2.7x beacons of 250 ms; 3000 ms = +70% beacons, capture 65% -> 74% vs 1000 (a hop costs 0.6-1.1 s on ath9k_htc)
         .clamp(100, 5000);
     let channels = parse_channels(&env::var("CHANNELS").unwrap_or_else(|_| "1,6,11".to_string()));
     println!(
@@ -1825,7 +1825,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.5 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.6 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
