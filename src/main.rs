@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -75,13 +75,25 @@ struct BeaconStat {
     ssid: String,
     channel: u8,
     rssi_sum: i32,
+    rssi_sq_sum: i64,
     n: u32,
     min: i8,
     max: i8,
 }
 
-/// [bssid, ssid, channel, mean rssi, min, max, n] serialized as a JSON array
-type BeaconItem = (String, String, u8, f32, i8, i8, u32);
+/// [bssid, ssid, channel, mean, min, max, n, std] serialized as a JSON array
+type BeaconItem = (String, String, u8, f32, i8, i8, u32, Option<f32>);
+
+/// Population std dev of beacon RSSI, 1 decimal; None for a single sample
+fn beacon_std(b: &BeaconStat) -> Option<f32> {
+    if b.n < 2 {
+        return None;
+    }
+    let n = b.n as f64;
+    let mean = b.rssi_sum as f64 / n;
+    let sd = (b.rssi_sq_sum as f64 / n - mean * mean).max(0.0).sqrt();
+    Some(((sd * 10.0).round() / 10.0) as f32)
+}
 
 struct BeaconBatch {
     time: String,
@@ -670,6 +682,7 @@ fn ingest_beacon(
         Entry::Occupied(mut occ) => {
             let e = occ.get_mut();
             e.rssi_sum += rssi as i32;
+            e.rssi_sq_sum += (rssi as i64) * (rssi as i64);
             e.n += 1;
             e.min = e.min.min(rssi);
             e.max = e.max.max(rssi);
@@ -683,6 +696,7 @@ fn ingest_beacon(
                     ssid,
                     channel,
                     rssi_sum: rssi as i32,
+                    rssi_sq_sum: (rssi as i64) * (rssi as i64),
                     n: 1,
                     min: rssi,
                     max: rssi,
@@ -751,9 +765,281 @@ fn finalize_record(raw: RawProbeRecord) -> EnrichedProbe {
     }
 }
 
+/// Minimal nl80211 channel setter over a raw generic-netlink socket (no iw spawn)
+mod nl80211 {
+    use std::io;
+
+    const GENL_ID_CTRL: u16 = 0x10;
+    const CTRL_CMD_GETFAMILY: u8 = 3;
+    const CTRL_ATTR_FAMILY_ID: u16 = 1;
+    const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+    const NLMSG_ERROR: u16 = 2;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_ACK: u16 = 4;
+    const NL80211_CMD_SET_WIPHY: u8 = 2;
+    const NL80211_ATTR_IFINDEX: u16 = 3;
+    const NL80211_ATTR_WIPHY_FREQ: u16 = 38;
+    const NL80211_ATTR_WIPHY_CHANNEL_TYPE: u16 = 39;
+
+    /// nlmsghdr + genlmsghdr + 4-byte aligned attributes (native endian)
+    fn build_msg(typ: u16, flags: u16, seq: u32, cmd: u8, version: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(64);
+        m.extend_from_slice(&[0; 4]); // length, patched below
+        m.extend_from_slice(&typ.to_ne_bytes());
+        m.extend_from_slice(&flags.to_ne_bytes());
+        m.extend_from_slice(&seq.to_ne_bytes());
+        m.extend_from_slice(&0u32.to_ne_bytes()); // pid: kernel assigns
+        m.extend_from_slice(&[cmd, version, 0, 0]);
+        for (t, payload) in attrs {
+            m.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+            m.extend_from_slice(&t.to_ne_bytes());
+            m.extend_from_slice(payload);
+            while m.len() % 4 != 0 {
+                m.push(0);
+            }
+        }
+        let len = m.len() as u32;
+        m[0..4].copy_from_slice(&len.to_ne_bytes());
+        m
+    }
+
+    fn build_getfamily(seq: u32) -> Vec<u8> {
+        build_msg(GENL_ID_CTRL, NLM_F_REQUEST, seq, CTRL_CMD_GETFAMILY, 1, &[(CTRL_ATTR_FAMILY_NAME, b"nl80211\0")])
+    }
+
+    fn build_set_channel(family: u16, seq: u32, ifindex: u32, ch: u8) -> Vec<u8> {
+        let freq = 2407 + 5 * ch as u32;
+        build_msg(
+            family,
+            NLM_F_REQUEST | NLM_F_ACK,
+            seq,
+            NL80211_CMD_SET_WIPHY,
+            0,
+            &[
+                (NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes()),
+                (NL80211_ATTR_WIPHY_FREQ, &freq.to_ne_bytes()),
+                (NL80211_ATTR_WIPHY_CHANNEL_TYPE, &0u32.to_ne_bytes()), // NL80211_CHAN_NO_HT
+            ],
+        )
+    }
+
+    /// Iterates netlink messages in `buf` as (type, seq, payload after nlmsghdr)
+    fn messages(buf: &[u8]) -> impl Iterator<Item = (u16, u32, &[u8])> {
+        let mut off = 0;
+        std::iter::from_fn(move || {
+            let h = buf.get(off..off + 16)?;
+            let len = u32::from_ne_bytes(h[0..4].try_into().unwrap()) as usize;
+            if len < 16 || off + len > buf.len() {
+                return None;
+            }
+            let item = (
+                u16::from_ne_bytes([h[4], h[5]]),
+                u32::from_ne_bytes(h[8..12].try_into().unwrap()),
+                &buf[off + 16..off + len],
+            );
+            off += (len + 3) & !3;
+            Some(item)
+        })
+    }
+
+    /// Error code of the NLMSG_ERROR reply for `seq` (0 = ack); None if absent
+    fn parse_ack(buf: &[u8], seq: u32) -> Option<i32> {
+        messages(buf)
+            .find(|&(t, s, p)| t == NLMSG_ERROR && s == seq && p.len() >= 4)
+            .map(|(_, _, p)| i32::from_ne_bytes(p[0..4].try_into().unwrap()))
+    }
+
+    /// Family id from a CTRL_CMD_GETFAMILY reply for `seq`
+    fn parse_family(buf: &[u8], seq: u32) -> Option<u16> {
+        let (_, _, p) = messages(buf).find(|&(t, s, _)| t == GENL_ID_CTRL && s == seq)?;
+        let mut a = p.get(4..)?; // skip genlmsghdr
+        while a.len() >= 4 {
+            let len = u16::from_ne_bytes([a[0], a[1]]) as usize;
+            if len < 4 || len > a.len() {
+                return None;
+            }
+            if u16::from_ne_bytes([a[2], a[3]]) == CTRL_ATTR_FAMILY_ID && len >= 6 {
+                return Some(u16::from_ne_bytes([a[4], a[5]]));
+            }
+            a = &a[((len + 3) & !3).min(a.len())..];
+        }
+        None
+    }
+
+    pub struct Hopper {
+        fd: i32,
+        family: u16,
+        ifindex: u32,
+        seq: u32,
+        buf: Vec<u8>, // the nl80211 GETFAMILY reply lists every command: several KB
+    }
+
+    impl Drop for Hopper {
+        fn drop(&mut self) {
+            // SAFETY: fd is owned by this struct and closed exactly once
+            unsafe { libc::close(self.fd) };
+        }
+    }
+
+    impl Hopper {
+        pub fn open(iface: &str) -> io::Result<Hopper> {
+            let name = std::ffi::CString::new(iface).map_err(|_| io::ErrorKind::InvalidInput)?;
+            // SAFETY: name is a valid NUL-terminated string
+            let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if ifindex == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: plain socket(2) call; result checked
+            let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::NETLINK_GENERIC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // From here Drop closes fd on every error path
+            let mut h = Hopper { fd, family: 0, ifindex, seq: 0, buf: vec![0u8; 32768] };
+            // SAFETY: zeroed sockaddr_nl is valid; pointers/lengths match the objects passed
+            let rc = unsafe {
+                let mut addr: libc::sockaddr_nl = std::mem::zeroed();
+                addr.nl_family = libc::AF_NETLINK as u16;
+                let tv = libc::timeval { tv_sec: 2 as _, tv_usec: 0 as _ };
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &tv as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as u32,
+                ) < 0
+                {
+                    -1
+                } else {
+                    libc::bind(
+                        fd,
+                        &addr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_nl>() as u32,
+                    )
+                }
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let seq = h.next_seq();
+            let msg = build_getfamily(seq);
+            h.family = h
+                .request(&msg, seq, parse_family)?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "nl80211 family not found"))?;
+            Ok(h)
+        }
+
+        fn next_seq(&mut self) -> u32 {
+            self.seq = self.seq.wrapping_add(1);
+            self.seq
+        }
+
+        /// Sends `msg`, then reads replies until `parse` yields a value (replies with other seqs are skipped)
+        fn request<T>(&mut self, msg: &[u8], seq: u32, parse: fn(&[u8], u32) -> Option<T>) -> io::Result<Option<T>> {
+            // SAFETY: msg points to msg.len() valid bytes
+            if unsafe { libc::send(self.fd, msg.as_ptr() as *const libc::c_void, msg.len(), 0) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let buf = &mut self.buf;
+            loop {
+                // SAFETY: buf is a valid writable buffer of buf.len() bytes
+                let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+                if n < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(v) = parse(&buf[..n as usize], seq) {
+                    return Ok(Some(v));
+                }
+            }
+        }
+
+        pub fn set_channel(&mut self, ch: u8) -> io::Result<()> {
+            if !(1..=13).contains(&ch) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let seq = self.next_seq();
+            let msg = build_set_channel(self.family, seq, self.ifindex, ch);
+            match self.request(&msg, seq, parse_ack)? {
+                Some(0) | None => Ok(()),
+                Some(code) => Err(io::Error::from_raw_os_error(-code)),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ne16(v: u16) -> [u8; 2] {
+            v.to_ne_bytes()
+        }
+        fn ne32(v: u32) -> [u8; 4] {
+            v.to_ne_bytes()
+        }
+
+        #[test]
+        fn test_set_channel_bytes() {
+            let mut e = Vec::new();
+            e.extend(ne32(44)); // 16 + 4 + 3*8
+            e.extend(ne16(0x1c)); // family
+            e.extend(ne16(5)); // REQUEST|ACK
+            e.extend(ne32(7)); // seq
+            e.extend(ne32(0)); // pid
+            e.extend([2, 0, 0, 0]); // SET_WIPHY
+            for (t, v) in [(3u16, 3u32), (38, 2437), (39, 0)] {
+                e.extend(ne16(8));
+                e.extend(ne16(t));
+                e.extend(ne32(v));
+            }
+            assert_eq!(build_set_channel(0x1c, 7, 3, 6), e);
+        }
+
+        #[test]
+        fn test_getfamily_bytes() {
+            let mut e = Vec::new();
+            e.extend(ne32(32)); // 16 + 4 + 12
+            e.extend(ne16(0x10));
+            e.extend(ne16(1));
+            e.extend(ne32(1));
+            e.extend(ne32(0));
+            e.extend([3, 1, 0, 0]);
+            e.extend(ne16(12));
+            e.extend(ne16(2));
+            e.extend(b"nl80211\0");
+            assert_eq!(build_getfamily(1), e);
+        }
+
+        #[test]
+        fn test_parse_ack() {
+            let ack = |seq: u32, code: i32| {
+                let mut m = Vec::new();
+                m.extend(ne32(20));
+                m.extend(ne16(NLMSG_ERROR));
+                m.extend(ne16(0));
+                m.extend(ne32(seq));
+                m.extend(ne32(0));
+                m.extend(code.to_ne_bytes());
+                m
+            };
+            assert_eq!(parse_ack(&ack(5, 0), 5), Some(0));
+            assert_eq!(parse_ack(&ack(5, -16), 5), Some(-16));
+            assert_eq!(parse_ack(&ack(4, 0), 5), None); // stale seq ignored
+        }
+
+        #[test]
+        fn test_parse_family() {
+            let mut m = build_msg(GENL_ID_CTRL, 0, 9, 1, 1, &[(CTRL_ATTR_FAMILY_NAME, b"nl80211\0"), (CTRL_ATTR_FAMILY_ID, &ne16(0x1c))]);
+            assert_eq!(parse_family(&m, 9), Some(0x1c));
+            assert_eq!(parse_family(&m, 8), None);
+            m.truncate(10);
+            assert_eq!(parse_family(&m, 9), None);
+        }
+    }
+}
+
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.5.0 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.0 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -775,7 +1061,12 @@ fn main() {
 
     let iface = env::var("SNIFFER_IFACE").unwrap_or_else(|_| "wlan0".to_string());
     println!("[*] Interface:       {}", iface);
-    println!("[*] Hopper Channels: 1, 6, 11 (250ms interval)");
+    let dwell_ms: u64 = env::var("DWELL_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(250)
+        .clamp(100, 5000);
+    println!("[*] Hopper Channels: 1, 6, 11 ({}ms dwell)", dwell_ms);
     println!(
         "[*] Bounds:          {} max records / {} retry batches",
         MAX_ACTIVE_RECORDS, MAX_QUEUED_BATCHES
@@ -787,26 +1078,44 @@ fn main() {
     let beacon_cache: Arc<Mutex<HashMap<[u8; 6], BeaconStat>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // 1. Channel Hopper Thread (only updates fallback channel on successful iw execution)
+    // 1. Channel Hopper Thread (nl80211 with `iw` fallback; channel updated only on success)
     let hopper_iface = iface.clone();
     thread::spawn(move || {
         let channels: [u8; 3] = [1, 6, 11];
+        let mut nl = nl80211::Hopper::open(&hopper_iface)
+            .map_err(|e| eprintln!("[!] nl80211 unavailable ({}), using iw", e))
+            .ok();
+        let mut last_err: Option<Instant> = None;
         let mut idx = 0;
         loop {
             let ch = channels[idx % channels.len()];
             idx += 1;
-            match Command::new("iw")
-                .args(["dev", &hopper_iface, "set", "channel", &ch.to_string()])
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    CURRENT_CHANNEL.store(ch, Ordering::Relaxed);
-                }
-                _ => {
-                    thread::sleep(Duration::from_secs(1));
+            let mut ok = false;
+            if let Some(h) = nl.as_mut() {
+                match h.set_channel(ch) {
+                    Ok(()) => ok = true,
+                    Err(e) => {
+                        if last_err.map_or(true, |t| t.elapsed() >= Duration::from_secs(600)) {
+                            eprintln!("[!] nl80211 set_channel failed ({}), falling back to iw", e);
+                            last_err = Some(Instant::now());
+                        }
+                    }
                 }
             }
-            thread::sleep(Duration::from_millis(250));
+            if !ok {
+                ok = matches!(
+                    Command::new("iw")
+                        .args(["dev", &hopper_iface, "set", "channel", &ch.to_string()])
+                        .status(),
+                    Ok(status) if status.success()
+                );
+            }
+            if ok {
+                CURRENT_CHANNEL.store(ch, Ordering::Relaxed);
+            } else {
+                thread::sleep(Duration::from_secs(1));
+            }
+            thread::sleep(Duration::from_millis(dwell_ms));
         }
     });
 
@@ -865,7 +1174,8 @@ fn main() {
                     .into_iter()
                     .map(|(bssid, b)| {
                         let mean = (b.rssi_sum as f32 / b.n as f32 * 10.0).round() / 10.0;
-                        (format_mac(&bssid), b.ssid, b.channel, mean, b.min, b.max, b.n)
+                        let std = beacon_std(&b);
+                        (format_mac(&bssid), b.ssid, b.channel, mean, b.min, b.max, b.n, std)
                     })
                     .collect();
                 if retry_queue.len() >= MAX_QUEUED_BATCHES {
@@ -973,7 +1283,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.5.0 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.0 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
@@ -1248,6 +1558,7 @@ mod tests {
         }
         let s = &map[&a];
         assert_eq!((s.rssi_sum, s.n, s.min, s.max), (-195, 3, -70, -60));
+        assert_eq!(s.rssi_sq_sum, 3600 + 4900 + 4225);
 
         for i in 0..MAX_BEACON_BSSIDS {
             ingest_beacon(&mut map, [2, i as u8, 0, 0, 0, 0], "y".into(), 1, -50);
@@ -1262,5 +1573,23 @@ mod tests {
         assert!(push_accepted(r#"{"status":"beacons_saved"}"#, "beacons_saved"));
         assert!(!push_accepted(r#"{"status":"probes_saved"}"#, "beacons_saved"));
         assert!(!push_accepted(r#"{"status":"beacons_saved"}"#, "probes_saved"));
+    }
+
+    #[test]
+    fn test_beacon_std() {
+        let mut map = HashMap::new();
+        let a = [1u8; 6];
+        ingest_beacon(&mut map, a, "x".into(), 6, -60);
+        let single = beacon_std(&map[&a]);
+        assert_eq!(single, None);
+        for r in [-60, -62, -58] {
+            ingest_beacon(&mut map, a, "x".into(), 6, r);
+        }
+        let sd = beacon_std(&map[&a]);
+        assert_eq!(sd, Some(1.4));
+
+        let item = |std| ("aa".to_string(), "s".to_string(), 6u8, -60.0f32, -62i8, -58i8, 4u32, std);
+        assert!(serde_json::to_string(&item(sd)).unwrap().ends_with(",1.4]"));
+        assert!(serde_json::to_string(&item(single)).unwrap().ends_with(",null]"));
     }
 }
