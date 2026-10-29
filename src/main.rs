@@ -1401,7 +1401,7 @@ mod nl80211 {
 
 fn main() {
     println!("========================================================");
-    println!("     ProbeHound v0.6.6 - 802.11 Probe Telemetry Engine   ");
+    println!("     ProbeHound v0.6.7 - 802.11 Probe Telemetry Engine   ");
     println!("========================================================");
 
     let mut webapp_url = env::var("WEBAPP_URL").unwrap_or_default();
@@ -1597,6 +1597,9 @@ fn main() {
             .timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(15))
             .timeout_write(Duration::from_secs(15))
+            // Overall deadline: timeout_read is not re-applied to pooled keep-alive sockets,
+            // a reused connection hung in recv for 37 h (2026-10-28).
+            .timeout(Duration::from_secs(60))
             .build();
 
         let mut retry_queue: VecDeque<Batch> = VecDeque::new();
@@ -1825,7 +1828,7 @@ fn main() {
             return;
         }
 
-        println!("[*] ProbeHound v0.6.6 active in monitor mode...");
+        println!("[*] ProbeHound v0.6.7 active in monitor mode...");
 
         let mut buf = [0u8; 2048];
         let mut consecutive_errors = 0u32;
